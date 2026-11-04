@@ -26,7 +26,7 @@ runs headless inside the console with no PC attached.
 | GP11     | CPU_RESET             | the glitch pulse — keep this wire **short**       |
 | GP12     | CPU_PLL_BYPASS        | **series resistor**: 5–10K on Slim, 22K on Phat   |
 | GP15     | POST                  | monitored bit (hard-coded as GPIO 15 in the PIO)  |
-| GP25     | debug LED (optional)  | on an RP2040-Zero GP25 is not the onboard LED     |
+| GP16     | onboard RGB LED       | RP2040-Zero WS2812: blue = glitching, green = booted |
 | 3V3      | switched 3.3V         | a rail that is live only when the console is **on** |
 | GND      | GND                   |                                                   |
 

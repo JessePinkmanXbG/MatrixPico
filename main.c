@@ -38,12 +38,22 @@
 #include "hardware/sync.h"
 #include "glitch.pio.h"
 
+/* Status LED. The RP2040-Zero's onboard RGB is a WS2812 on GP16; a classic
+ * Pico has a plain LED on GP25. Set USE_WS2812 to match your board. */
+#define USE_WS2812 1
+#if USE_WS2812
+#include "ws2812.pio.h"
+#define LED_PIN 16
+#else
+#define LED_PIN 25
+#endif
+
 /* ---- Motherboard wiring (Pico GPIO -> Xbox 360 point) -------------------
  * GP11 -> CPU_RESET      (glitch pulse)
  * GP12 -> CPU_PLL_BYPASS (series resistor: 5-10K on Slim, 22K on Phat)
  * GP15 -> POST           (bit monitored; referenced as GPIO 15 in glitch.pio)
- * GP25 -> debug LED       (on an RP2040-Zero GP25 is not the onboard LED;
- *                          wire a plain LED to GP25 or just use the console)
+ * GP16 -> onboard WS2812 (RP2040-Zero): blue = glitching, green = booted.
+ *                          Classic Pico: set USE_WS2812 0 to use GP25.
  * 3V3 / GND -> switched 3.3V and ground
  *
  * POST is hard-coded to GPIO 15 inside glitch.pio. If you move it, change it
@@ -52,9 +62,8 @@
 #define CPU_RESET   11
 #define PLL_BYPASS  12
 #define POST_PIN    15
-#define DEBUG_LED   25
 
-#define SYS_CLK_KHZ 266000
+#define MP_SYS_CLK_KHZ 266000
 
 /* ---- Profiles ----------------------------------------------------------- */
 #define NUM_TIMINGS     5
@@ -150,6 +159,29 @@ static void config_save(void)
     multicore_lockout_end_blocking();
 }
 
+/* ---- Status LED --------------------------------------------------------- */
+#if USE_WS2812
+static PIO  led_pio = pio1;
+static uint led_sm  = 0;
+
+static inline void led_raw(uint32_t grb) { pio_sm_put_blocking(led_pio, led_sm, grb << 8u); }
+static inline uint32_t led_rgb(uint8_t r, uint8_t g, uint8_t b) {
+    return ((uint32_t)r << 8) | ((uint32_t)g << 16) | (uint32_t)b;
+}
+static void led_init(void) {
+    uint off = pio_add_program(led_pio, &ws2812_program);
+    ws2812_program_init(led_pio, led_sm, off, LED_PIN, 800000, false);
+}
+static inline void led_off(void)   { led_raw(0); }
+static inline void led_blue(void)  { led_raw(led_rgb(0, 0, 24)); }
+static inline void led_green(void) { led_raw(led_rgb(0, 24, 0)); }
+#else
+static void led_init(void) { gpio_init(LED_PIN); gpio_set_dir(LED_PIN, GPIO_OUT); }
+static inline void led_off(void)   { gpio_put(LED_PIN, 0); }
+static inline void led_blue(void)  { gpio_put(LED_PIN, 1); }
+static inline void led_green(void) { gpio_put(LED_PIN, 1); }
+#endif
+
 /* ---- Glitch core (core1) ------------------------------------------------ */
 
 static void run_glitch_once(PIO pio, uint sm, uint offset)
@@ -182,11 +214,9 @@ static void run_glitch_once(PIO pio, uint sm, uint offset)
     pio_sm_init(pio, sm, offset, &c);
     pio_sm_set_enabled(pio, sm, true);
 
-    sleep_ms(200);
+    led_blue();          /* blue flashes once per glitch attempt */
 
-    gpio_init(DEBUG_LED);
-    gpio_set_dir(DEBUG_LED, GPIO_OUT);
-    gpio_put(DEBUG_LED, 1);
+    sleep_ms(200);
 
     pio_sm_put_blocking(pio, sm, t[0]);   /* post_count   */
     pio_sm_put_blocking(pio, sm, t[1]);   /* delay_to_pll */
@@ -199,12 +229,23 @@ static void run_glitch_once(PIO pio, uint sm, uint offset)
     pio_sm_set_enabled(pio, sm, false);
     pio_sm_restart(pio, sm);
 
-    gpio_put(DEBUG_LED, 0);
+    led_off();
 
     gpio_init(CPU_RESET);
     gpio_set_dir(CPU_RESET, GPIO_IN);
-    while (gpio_get(CPU_RESET))
+
+    /* If CPU_RESET stays high, the console came up -> solid green. If it drops
+     * quickly, the glitch missed and we loop round for another attempt. */
+    absolute_time_t t0 = get_absolute_time();
+    bool booted = false;
+    while (gpio_get(CPU_RESET)) {
+        if (!booted && absolute_time_diff_us(t0, get_absolute_time()) > 2000000) {
+            led_green();
+            booted = true;
+        }
         tight_loop_contents();
+    }
+    led_off();
 
     g_attempts++;
 }
@@ -213,6 +254,9 @@ static void core1_main(void)
 {
     /* Allow core0 to pause us while it writes flash. */
     multicore_lockout_victim_init();
+
+    led_init();
+    led_off();
 
     PIO pio = pio0;
     uint sm = 0;
@@ -370,7 +414,7 @@ int main(void)
 {
     /* Overclock for glitch-pulse resolution (~3.75 ns/cycle at 266 MHz). */
     vreg_set_voltage(VREG_VOLTAGE_1_30);
-    set_sys_clock_khz(SYS_CLK_KHZ, true);
+    set_sys_clock_khz(MP_SYS_CLK_KHZ, true);
 
     uint32_t freq = clock_get_hz(clk_sys);
     clock_configure(clk_peri, 0, CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
