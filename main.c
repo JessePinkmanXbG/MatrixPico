@@ -214,9 +214,14 @@ static void run_glitch_once(PIO pio, uint sm, uint offset)
     pio_sm_init(pio, sm, offset, &c);
     pio_sm_set_enabled(pio, sm, true);
 
-    led_blue();          /* blue flashes once per glitch attempt */
-
-    sleep_ms(200);
+    /* Fast blue flashing during the arm window (before the glitch pulse), so
+     * repeated attempts show as a rapid blue flicker. ~200ms total. */
+    for (int i = 0; i < 6; i++) {
+        led_blue();
+        sleep_ms(17);
+        led_off();
+        sleep_ms(17);
+    }
 
     pio_sm_put_blocking(pio, sm, t[0]);   /* post_count   */
     pio_sm_put_blocking(pio, sm, t[1]);   /* delay_to_pll */
@@ -234,14 +239,17 @@ static void run_glitch_once(PIO pio, uint sm, uint offset)
     gpio_init(CPU_RESET);
     gpio_set_dir(CPU_RESET, GPIO_IN);
 
-    /* If CPU_RESET stays high, the console came up -> solid green. If it drops
-     * quickly, the glitch missed and we loop round for another attempt. */
+    /* If CPU_RESET stays high, the console booted: flash green briefly, then
+     * go dark so the LED isn't lit while the console runs. If it drops quickly,
+     * the glitch missed and we loop round for another attempt. */
     absolute_time_t t0 = get_absolute_time();
-    bool booted = false;
+    bool shown = false;
     while (gpio_get(CPU_RESET)) {
-        if (!booted && absolute_time_diff_us(t0, get_absolute_time()) > 2000000) {
+        if (!shown && absolute_time_diff_us(t0, get_absolute_time()) > 1500000) {
             led_green();
-            booted = true;
+            sleep_ms(1500);
+            led_off();
+            shown = true;
         }
         tight_loop_contents();
     }
