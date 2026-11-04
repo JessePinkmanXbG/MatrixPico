@@ -131,6 +131,19 @@ static const uint8_t *g_flash_cfg = (const uint8_t *)(XIP_BASE + FLASH_TARGET_OF
 /* Shared glitch counter so the console can report activity. */
 static volatile uint32_t g_attempts = 0;
 
+/* Sweep (auto-tune) state, shared core0 <-> core1. When active, core1 applies
+ * sweep_val to the active profile's timing[sweep_idx] on each attempt and steps
+ * it after every miss; on a boot it latches the landing value and stops. */
+static volatile bool     sweep_active = false;
+static volatile int      sweep_idx = 0;
+static volatile uint32_t sweep_start = 0;
+static volatile uint32_t sweep_end = 0;
+static volatile int32_t  sweep_step = 0;
+static volatile uint32_t sweep_val = 0;
+static volatile uint32_t sweep_tick = 0;         /* bumped each step, for core0 */
+static volatile bool     sweep_landed = false;
+static volatile uint32_t sweep_landed_val = 0;
+
 /* ---- Flash persistence -------------------------------------------------- */
 
 static void config_load(void)
@@ -186,6 +199,9 @@ static inline void led_green(void) { gpio_put(LED_PIN, 1); }
 
 static void run_glitch_once(PIO pio, uint sm, uint offset)
 {
+    if (sweep_active)
+        g_cfg.profiles[g_cfg.active].t[sweep_idx] = sweep_val;
+
     const uint32_t *t = g_cfg.profiles[g_cfg.active].t;
 
     gpio_init(CPU_RESET);
@@ -244,8 +260,10 @@ static void run_glitch_once(PIO pio, uint sm, uint offset)
      * the glitch missed and we loop round for another attempt. */
     absolute_time_t t0 = get_absolute_time();
     bool shown = false;
+    bool booted = false;
     while (gpio_get(CPU_RESET)) {
         if (!shown && absolute_time_diff_us(t0, get_absolute_time()) > 1500000) {
+            booted = true;
             /* boot confirmed: flash blue 2.5s, then solid green 5s, then off */
             absolute_time_t s0 = get_absolute_time();
             while (absolute_time_diff_us(s0, get_absolute_time()) < 2500000) {
@@ -262,6 +280,21 @@ static void run_glitch_once(PIO pio, uint sm, uint offset)
         tight_loop_contents();
     }
     led_off();
+
+    if (sweep_active) {
+        if (booted) {
+            sweep_landed_val = sweep_val;
+            sweep_landed = true;
+            sweep_active = false;
+        } else {
+            int64_t nv = (int64_t)sweep_val + (int64_t)sweep_step;
+            if ((sweep_step > 0 && nv > (int64_t)sweep_end) ||
+                (sweep_step < 0 && nv < (int64_t)sweep_end))
+                nv = (int64_t)sweep_start;        /* wrap around */
+            sweep_val = (uint32_t)nv;
+            sweep_tick++;
+        }
+    }
 
     g_attempts++;
 }
@@ -331,6 +364,8 @@ static void print_help(void)
         "  defaults             restore built-in defaults (not saved yet)\n"
         "  attempts             reset the attempt counter\n"
         "  mon                  watch CPU_RESET/POST live for 6s (power-cycle to test)\n"
+        "  sweep <i> <a> <b> [s] auto-step timing i from a to b until it boots\n"
+        "  sweepstop            cancel an active sweep\n"
         "timing index: 0 post_count  1 delay_to_pll  2 delay_to_rst\n"
         "              3 glitch_width 4 pll_hold\n");
 }
@@ -414,6 +449,36 @@ static void handle_line(char *line)
         printf("POST(28):      %s\n",
                (ph && pl) ? "TOGGLED  (seen high & low - wire good)" :
                (ph ? "always HIGH (stuck)" : "always LOW  (no POST - check this wire)"));
+    } else if (!strcmp(cmd, "sweep")) {
+        char *a = strtok(NULL, " \t");
+        char *b = strtok(NULL, " \t");
+        char *c = strtok(NULL, " \t");
+        char *d = strtok(NULL, " \t");
+        if (!a || !b || !c) {
+            printf("err: sweep <idx 0-4> <start> <end> [step]\n");
+            return;
+        }
+        int idx = atoi(a);
+        if (idx < 0 || idx >= NUM_TIMINGS) { printf("err: idx 0-4\n"); return; }
+        uint32_t s = (uint32_t)strtoul(b, NULL, 0);
+        uint32_t e = (uint32_t)strtoul(c, NULL, 0);
+        int32_t st = d ? (int32_t)strtol(d, NULL, 0) : (e >= s ? 1 : -1);
+        if (st == 0) { printf("err: step cannot be 0\n"); return; }
+        sweep_idx = idx;
+        sweep_start = s;
+        sweep_end = e;
+        sweep_step = st;
+        sweep_val = s;
+        sweep_tick = 0;
+        sweep_landed = false;
+        sweep_active = true;
+        printf("sweeping %s from %lu to %lu step %ld\n", TIMING_NAMES[idx],
+               (unsigned long)s, (unsigned long)e, (long)st);
+        printf("power-cycle the console; it steps each miss until it boots.\n");
+    } else if (!strcmp(cmd, "sweepstop")) {
+        sweep_active = false;
+        printf("sweep stopped at %s=%lu ('save' to keep).\n",
+               TIMING_NAMES[sweep_idx], (unsigned long)sweep_val);
     } else {
         printf("err: unknown command '%s' (try 'help')\n", cmd);
     }
@@ -468,8 +533,19 @@ int main(void)
     print_status();
     printf("> ");
 
+    uint32_t last_tick = 0;
     while (true) {
         console_task();
+        if (sweep_active && sweep_tick != last_tick) {
+            last_tick = sweep_tick;
+            printf("  sweep: %s = %lu\n", TIMING_NAMES[sweep_idx],
+                   (unsigned long)sweep_val);
+        }
+        if (sweep_landed) {
+            sweep_landed = false;
+            printf("\n*** GLITCH LANDED: %s = %lu ***  ('save' to keep)\n> ",
+                   TIMING_NAMES[sweep_idx], (unsigned long)sweep_landed_val);
+        }
         sleep_ms(2);
     }
     return 0;
