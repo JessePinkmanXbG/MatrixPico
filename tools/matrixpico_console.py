@@ -2,56 +2,43 @@
 """
 Matrix Pico Console - serial tuning GUI for the Matrix Pico glitcher.
 
-Silver-gradient UI, green terminal styling. Auto-finds the Pico's COM port,
-pick a console in one click, and drive every tuning feature from the debug
-panel. Builds to a single Windows .exe (PyInstaller). No external assets.
+Neon cyan-grid UI with glowing green pill buttons. Auto-finds the Pico's COM
+port, pick a console in one click, and drive every tuning feature from the
+debug panel. Builds to a single Windows .exe (PyInstaller, assets bundled).
 
-Run from source:  pip install pyserial  &&  python matrixpico_console.py
+Run from source:  pip install pyserial pillow  &&  python matrixpico_console.py
 """
 
+import os
+import sys
 import threading
 import queue
 import tkinter as tk
-from tkinter import ttk, scrolledtext
+from tkinter import ttk
 
 import serial
 import serial.tools.list_ports
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageTk
 
 RP2040_VID = 0x2E8A
+WIN_W, WIN_H = 900, 720
 
-# ---- palette --------------------------------------------------------------
-SILVER_TOP   = (0x26, 0x2C, 0x2E)
-SILVER_MID   = (0x0E, 0x11, 0x12)
-SILVER_LOW   = (0x15, 0x19, 0x1A)
-SILVER_BOT   = (0x05, 0x07, 0x07)
+NEON = (57, 255, 20)
+CYAN = "#00f0ff"
+TERM_BG = "#020612"
+TERM_FG = "#39ff14"
+ENTRY_BG = "#02061a"
+BORDER = "#00aae6"
 
-GREEN        = "#2ecc40"
-GREEN_NEON   = "#39ff14"
-GREEN_DK     = "#0a2a0a"
-GREEN_BORDER = "#1f7a1f"
-INK          = "#d6f5dc"
-PANEL        = "#14191a"
-PANEL_HEAD   = "#0a0d0d"
-TERM_BG      = "#050805"
-TERM_FG      = "#33ff33"
-
-CONSOLES = [
-    ("TRINITY", "trinity"),
-    ("CORONA",  "corona"),
-    ("FALCON",  "falcon"),
-    ("JASPER",  "jasper"),
-    ("ZEPHYR",  "zephyr"),
-]
-
-ACTIONS = [
-    ("STATUS", "status"), ("LIST", "list"), ("MON", "mon"),
-    ("SAVE", "save"), ("LOAD", "load"), ("DEFAULTS", "defaults"),
-    ("HELP", "help"),
-]
+CONSOLES = ["trinity", "corona", "falcon", "jasper", "zephyr"]
+ACTIONS = [("STATUS", "status"), ("LIST", "list"), ("MON", "mon"),
+           ("SAVE", "save"), ("LOAD", "load"), ("DEFAULTS", "defaults"),
+           ("HELP", "help")]
 
 
-def lerp(a, b, t):
-    return tuple(int(x + (y - x) * t) for x, y in zip(a, b))
+def asset(name):
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, "assets", name)
 
 
 def find_ports():
@@ -68,309 +55,234 @@ def find_ports():
     return out
 
 
-try:
-    from PIL import Image, ImageDraw, ImageChops, ImageTk
-    HAVE_PIL = True
-except Exception:
-    HAVE_PIL = False
-
-# glossy pill palettes: (top, bottom, border)
-PALETTES = {
-    "normal": ((14, 170, 88),  (0, 200, 100),  (10, 92, 46)),
-    "hover":  ((40, 200, 115), (20, 225, 125), (10, 92, 46)),
-    "press":  ((0, 135, 66),   (0, 160, 78),   (6, 66, 30)),
-    "active": ((0, 112, 46),   (0, 148, 66),   (255, 255, 255)),
-}
-_pill_cache = {}
+# --------------------------------------------------------------------------
+# neon pill button rendering (Pillow, cached)
+# --------------------------------------------------------------------------
+MARGIN = 14
+_font_cache = {}
+_img_cache = {}
 
 
-def make_pill(w, h, state):
-    key = (w, h, state)
-    if key in _pill_cache:
-        return _pill_cache[key]
-    S = 4
-    W, H = w * S, h * S
-    top, bot, border = PALETTES[state]
-    outer = Image.new("L", (W, H), 0)
-    ImageDraw.Draw(outer).rounded_rectangle([0, 0, W - 1, H - 1], radius=H // 2, fill=255)
-    b = 2 * S
-    inner = Image.new("L", (W, H), 0)
-    ImageDraw.Draw(inner).rounded_rectangle([b, b, W - 1 - b, H - 1 - b],
-                                            radius=(H - 2 * b) // 2, fill=255)
-    img = Image.new("RGB", (W, H), border)
-    grad = Image.new("RGB", (W, H))
-    gd = ImageDraw.Draw(grad)
-    for y in range(H):
-        t = y / (H - 1)
-        gd.line([(0, y), (W, y)],
-                fill=tuple(int(top[i] + (bot[i] - top[i]) * t) for i in range(3)))
-    img.paste(grad, (0, 0), inner)
-    # glossy highlight on the upper half
-    ins = 4 * S
-    gh = int(H * 0.50)
-    shape = Image.new("L", (W, H), 0)
-    ImageDraw.Draw(shape).rounded_rectangle([ins, b + S, W - 1 - ins, gh],
-                                            radius=(gh - b) // 2, fill=255)
-    fade = Image.new("L", (W, H), 0)
-    fd = ImageDraw.Draw(fade)
-    for y in range(H):
-        fd.line([(0, y), (W, y)], fill=max(0, int(150 * (1 - y / gh))) if y < gh else 0)
-    gloss = ImageChops.multiply(shape, fade)
-    img.paste(Image.new("RGB", (W, H), (225, 255, 235)), (0, 0), gloss)
-    out = img.convert("RGBA")
-    out.putalpha(outer)
-    out = out.resize((w, h), Image.LANCZOS)
+def _font(size):
+    if size not in _font_cache:
+        try:
+            _font_cache[size] = ImageFont.truetype(asset("Inter-ExtraBoldItalic.otf"), size)
+        except Exception:
+            try:
+                _font_cache[size] = ImageFont.truetype("arialbi.ttf", size)
+            except Exception:
+                _font_cache[size] = ImageFont.load_default()
+    return _font_cache[size]
+
+
+def make_btn(w, h, text, state, big):
+    key = (w, h, text, state, big)
+    if key in _img_cache:
+        return _img_cache[key]
+    K = 3
+    M = MARGIN
+    W, H = (w + 2 * M) * K, (h + 2 * M) * K
+    r = h * K // 2
+    box = [M * K, M * K, (M + w) * K, (M + h) * K]
+    glow_r = {"normal": 4, "hover": 7, "press": 3, "active": 9}[state]
+    glow_a = {"normal": 150, "hover": 220, "press": 110, "active": 255}[state]
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(layer).rounded_rectangle(box, radius=r, outline=NEON + (glow_a,), width=2 * K)
+    glow = layer.filter(ImageFilter.GaussianBlur(glow_r * K))
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    img.alpha_composite(glow)
+    d = ImageDraw.Draw(img)
+    if state == "active":
+        fill = NEON + (255,)
+    elif state == "hover":
+        fill = (10, 46, 14, 255)
+    elif state == "press":
+        fill = (18, 70, 22, 255)
+    else:
+        fill = (6, 28, 10, 255)
+    d.rounded_rectangle(box, radius=r, fill=fill, outline=NEON + (255,), width=int(1.8 * K))
+    if state != "active":
+        hl = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ImageDraw.Draw(hl).rounded_rectangle(
+            [box[0] + 8 * K, box[1] + 3 * K, box[2] - 8 * K, box[1] + (h // 2) * K - K],
+            radius=(h // 4) * K, fill=(255, 255, 255, 24))
+        img.alpha_composite(hl)
+        d = ImageDraw.Draw(img)
+    f = _font(int((17 if big else 13) * K))
+    dy = K if state == "press" else 0
+    col = (4, 8, 14, 255) if state == "active" else NEON + (255,)
+    d.text(((M + w / 2) * K, (M + h / 2) * K + dy), text, font=f, fill=col, anchor="mm")
+    out = img.resize((w + 2 * M, h + 2 * M), Image.LANCZOS)
     photo = ImageTk.PhotoImage(out)
-    _pill_cache[key] = photo
+    _img_cache[key] = photo
     return photo
 
 
-class GlossButton(tk.Canvas):
-    """Round glossy green pill button (drawn with Pillow, text via canvas)."""
+class NeonButton:
+    """A rounded neon button drawn as a canvas item (so glow blends with the bg)."""
 
-    def __init__(self, parent, text, command, width=10, big=False):
-        self.w = width * (10 if big else 8) + (30 if big else 18)
-        self.h = 40 if big else 28
-        super().__init__(parent, width=self.w, height=self.h,
-                         bg=parent.cget("bg"), highlightthickness=0, bd=0,
-                         cursor="hand2")
-        self.text, self.command = text, command
-        self.font = ("Consolas", 12 if big else 10, "bold")
-        self.active = False
-        self.hover = False
-        self.pressed = False
-        self.bind("<Configure>", lambda e: self._draw())
-        self.bind("<Enter>", lambda e: self._set(hover=True))
-        self.bind("<Leave>", lambda e: self._set(hover=False, pressed=False))
-        self.bind("<ButtonPress-1>", lambda e: self._set(pressed=True))
-        self.bind("<ButtonRelease-1>", self._release)
-        self._draw()
+    def __init__(self, canvas, x, y, w, h, text, command, big=False):
+        self.c, self.x, self.y, self.w, self.h = canvas, x, y, w, h
+        self.text, self.command, self.big = text, command, big
+        self.active = self.hover = self.pressed = False
+        self.item = canvas.create_image(x - MARGIN, y - MARGIN, anchor="nw",
+                                        image=make_btn(w, h, text, "normal", big))
+        for ev, fn in (("<Enter>", self._enter), ("<Leave>", self._leave),
+                       ("<ButtonPress-1>", self._press), ("<ButtonRelease-1>", self._release)):
+            canvas.tag_bind(self.item, ev, fn)
 
-    def _set(self, **kw):
-        for k, v in kw.items():
-            setattr(self, k, v)
-        self._draw()
+    def _state(self):
+        if self.pressed:
+            return "press"
+        if self.active:
+            return "active"
+        return "hover" if self.hover else "normal"
+
+    def _refresh(self):
+        self.c.itemconfigure(self.item, image=make_btn(self.w, self.h, self.text, self._state(), self.big))
+
+    def _enter(self, e):
+        self.hover = True
+        self.c.configure(cursor="hand2")
+        self._refresh()
+
+    def _leave(self, e):
+        self.hover = self.pressed = False
+        self.c.configure(cursor="")
+        self._refresh()
+
+    def _press(self, e):
+        self.pressed = True
+        self._refresh()
 
     def _release(self, e):
         was = self.pressed
-        self._set(pressed=False)
-        if was and 0 <= e.x <= self.winfo_width() and 0 <= e.y <= self.winfo_height():
+        self.pressed = False
+        self._refresh()
+        if was and self.x <= e.x <= self.x + self.w and self.y <= e.y <= self.y + self.h:
             self.command()
 
     def set_active(self, flag):
         self.active = flag
-        self._draw()
+        self._refresh()
 
-    def _draw(self):
-        w = max(self.winfo_width(), 2)
-        h = max(self.winfo_height(), 2)
-        if w < 20:
-            w, h = self.w, self.h
-        state = ("press" if self.pressed else "active" if self.active
-                 else "hover" if self.hover else "normal")
-        self._img = make_pill(w, h, state)
-        self.delete("all")
-        self.create_image(0, 0, image=self._img, anchor="nw")
-        dy = 1 if self.pressed else 0
-        self.create_text(w // 2 + 1, h // 2 + 1 + dy, text=self.text,
-                         font=self.font, fill="#0a4a22")
-        self.create_text(w // 2, h // 2 + dy, text=self.text,
-                         font=self.font, fill="#ffffff")
+    def set_text(self, text):
+        self.text = text
+        self._refresh()
 
 
-class FlatButton(tk.Button):
-    """Fallback when Pillow is unavailable."""
-
-    def set_active(self, flag):
-        self.configure(bg="#39ff14" if flag else "#0d0d0d",
-                       fg="#061006" if flag else GREEN_NEON)
-
-
-def term_button(parent, text, cmd, width=10, big=False):
-    if HAVE_PIL:
-        return GlossButton(parent, text, cmd, width, big)
-    return FlatButton(
-        parent, text=text, command=cmd, cursor="hand2",
-        bg="#0d0d0d", fg=GREEN_NEON,
-        activebackground=GREEN_DK, activeforeground="#7CFC00",
-        font=("Consolas", 12 if big else 10, "bold"),
-        relief="flat", bd=0, highlightthickness=1,
-        highlightbackground=GREEN_BORDER, padx=6, pady=6 if big else 3, width=width)
-
-
+# --------------------------------------------------------------------------
 class App:
     def __init__(self, root):
         self.root = root
         root.title("MatrixPico")
-        root.geometry("900x720")
-        root.minsize(900, 720)
-        root.configure(bg="#0e1112")
+        root.geometry(f"{WIN_W}x{WIN_H}")
+        root.resizable(False, False)
+        root.configure(bg="#020818")
 
         self.ser = None
         self.stop = threading.Event()
         self.rxq = queue.Queue()
         self.devices = []
-        self.active_console = None
         self.console_btns = {}
 
-        # ---- gradient background (fills the window) ----
-        self.bg = tk.Canvas(root, highlightthickness=0, bd=0)
-        self.bg.place(x=0, y=0, relwidth=1, relheight=1)
-        self.bg.bind("<Configure>", self._draw_bg)
+        self.canvas = tk.Canvas(root, width=WIN_W, height=WIN_H, highlightthickness=0, bd=0)
+        self.canvas.place(x=0, y=0)
+        try:
+            self.bg = tk.PhotoImage(file=asset("bg.png"))
+            self.canvas.create_image(0, 0, anchor="nw", image=self.bg)
+        except Exception:
+            self.canvas.configure(bg="#020818")
 
-        self._build_logo()
+        self._style()
         self._build_connection()
-        self._build_console_panel()
-        self._build_debug_panel()
+        self._build_consoles()
+        self._build_debug()
 
         self.refresh_ports(auto_connect=True)
         self.root.after(60, self.drain)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    # ---- background + logo -------------------------------------------------
-    def _draw_bg(self, event=None):
-        c = self.bg
-        c.delete("bgfill")
-        w = c.winfo_width() or 900
-        h = c.winfo_height() or 720
-        for i in range(h):
-            t = i / max(h - 1, 1)
-            if t < 0.5:
-                col = lerp(SILVER_TOP, SILVER_MID, t * 2)
-            else:
-                col = lerp(SILVER_LOW, SILVER_BOT, (t - 0.5) * 2)
-            c.create_line(0, i, w, i, fill="#%02x%02x%02x" % col, tags="bgfill")
-        # diagonal sheen
-        c.create_polygon(0, 0, int(w * 0.42), 0, 0, int(h * 0.55),
-                         fill="#2f383a", outline="", stipple="gray25", tags="bgfill")
-        c.tag_lower("bgfill")
+    # ---- ttk dark styling ----------------------------------------------------
+    def _style(self):
+        st = ttk.Style()
+        st.theme_use("clam")
+        st.configure("Neon.TCombobox", fieldbackground="#04101f", background="#04101f",
+                     foreground=TERM_FG, arrowcolor=CYAN, bordercolor=BORDER,
+                     lightcolor="#04101f", darkcolor="#04101f", selectbackground="#04101f",
+                     selectforeground=TERM_FG)
+        st.map("Neon.TCombobox", fieldbackground=[("readonly", "#04101f")],
+               foreground=[("readonly", TERM_FG)], selectbackground=[("readonly", "#04101f")],
+               selectforeground=[("readonly", TERM_FG)])
+        st.configure("Neon.Vertical.TScrollbar", background="#06304a", troughcolor=TERM_BG,
+                     bordercolor=TERM_BG, arrowcolor=CYAN, lightcolor="#06304a", darkcolor="#06304a")
+        st.map("Neon.Vertical.TScrollbar", background=[("active", "#0a5a80"), ("!active", "#06304a")],
+               arrowcolor=[("!disabled", CYAN)])
+        self.root.option_add("*TCombobox*Listbox.background", "#04101f")
+        self.root.option_add("*TCombobox*Listbox.foreground", TERM_FG)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", "#0a4a1a")
 
-    def _build_logo(self):
-        # Doom-style blocky logo: 5x7 bitmap letters drawn as beveled green
-        # blocks on the canvas (font-independent, looks the same everywhere).
-        c = self.bg
-        glyphs = {
-            "M": ["10001", "11011", "10101", "10101", "10001", "10001", "10001"],
-            "A": ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
-            "T": ["11111", "00100", "00100", "00100", "00100", "00100", "00100"],
-            "R": ["11110", "10001", "10001", "11110", "10100", "10010", "10001"],
-            "I": ["11111", "00100", "00100", "00100", "00100", "00100", "11111"],
-            "X": ["10001", "10001", "01010", "00100", "01010", "10001", "10001"],
-            "P": ["11110", "10001", "10001", "11110", "10000", "10000", "10000"],
-            "C": ["01111", "10000", "10000", "10000", "10000", "10000", "01111"],
-            "O": ["01110", "10001", "10001", "10001", "10001", "10001", "01110"],
-        }
-        word = "MATRIXPICO"
-        cell, gap = 9, 12
-        total_w = len(word) * 5 * cell + (len(word) - 1) * gap
-        x0 = (900 - total_w) // 2
-        y0 = 14
-        shades = ["#6bff6b", "#39ff14", "#2ecc40", "#23a834", "#17802a", "#0f5a1d", "#0a3d14"]
-        for li, ch in enumerate(word):
-            lx = x0 + li * (5 * cell + gap)
-            for r, row in enumerate(glyphs[ch]):
-                for col, bit in enumerate(row):
-                    if bit != "1":
-                        continue
-                    x, y = lx + col * cell, y0 + r * cell
-                    c.create_rectangle(x + 3, y + 3, x + cell + 3, y + cell + 3,
-                                       fill="#000000", outline="")          # drop shadow
-                    c.create_rectangle(x, y, x + cell, y + cell,
-                                       fill=shades[r], outline="#0a3d14")  # block
-                    c.create_line(x + 1, y + 1, x + cell - 1, y + 1, fill="#c8ffc8")  # top bevel
-                    c.create_line(x + 1, y + 1, x + 1, y + cell - 1, fill="#9dffa0")  # left bevel
-
-    # ---- connection bar ----------------------------------------------------
+    # ---- connection bar ------------------------------------------------------
     def _build_connection(self):
-        bar = tk.Frame(self.root, bg=PANEL, highlightthickness=1,
-                       highlightbackground=GREEN_BORDER)
-        bar.place(x=20, y=104, width=860, height=46)
-        tk.Label(bar, text="PORT", bg=PANEL, fg=INK,
-                 font=("Consolas", 10, "bold")).place(x=12, y=12)
         self.port_var = tk.StringVar()
-        self.port_cb = ttk.Combobox(bar, textvariable=self.port_var, width=26,
-                                    state="readonly")
-        self.port_cb.place(x=62, y=11, width=250)
-        term_button(bar, "REFRESH", self.refresh_ports, width=9).place(x=324, y=9)
-        self.connect_btn = term_button(bar, "CONNECT", self.toggle, width=10)
-        self.connect_btn.place(x=438, y=9)
-        self.status_var = tk.StringVar(value="not connected")
-        tk.Label(bar, textvariable=self.status_var, bg=PANEL, fg="#ff5a5a",
-                 font=("Consolas", 10, "bold")).place(x=560, y=12)
+        self.port_cb = ttk.Combobox(self.root, textvariable=self.port_var, state="readonly",
+                                    style="Neon.TCombobox", font=("Consolas", 10))
+        self.port_cb.place(x=78, y=119, width=250, height=24)
+        NeonButton(self.canvas, 340, 118, 92, 28, "REFRESH", self.refresh_ports)
+        self.connect_btn = NeonButton(self.canvas, 446, 118, 100, 28, "CONNECT", self.toggle)
+        self.dot = self.canvas.create_oval(566, 125, 576, 135, fill="#ff5a5a", outline="")
+        self.status_id = self.canvas.create_text(584, 130, anchor="w", text="not connected",
+                                                 fill="#ff5a5a", font=("Consolas", 10, "bold"))
 
-    # ---- console picker ----------------------------------------------------
-    def _build_console_panel(self):
-        panel = tk.Frame(self.root, bg=PANEL, highlightthickness=1,
-                         highlightbackground=GREEN_BORDER)
-        panel.place(x=20, y=164, width=250, height=540)
-        head = tk.Frame(panel, bg=PANEL_HEAD, height=30)
-        head.pack(fill="x")
-        tk.Label(head, text="// CONSOLE", bg=PANEL_HEAD, fg=GREEN_NEON,
-                 font=("Consolas", 12, "bold")).pack(side="left", padx=10, pady=4)
+    def set_status(self, text, ok):
+        col = "#3cff78" if ok else "#ff5a5a"
+        self.canvas.itemconfigure(self.dot, fill=col)
+        self.canvas.itemconfigure(self.status_id, text=text, fill=col)
 
-        body = tk.Frame(panel, bg=PANEL)
-        body.pack(fill="both", expand=True, padx=14, pady=12)
-        tk.Label(body, text="select a board:", bg=PANEL, fg="#9fb8a5",
-                 font=("Consolas", 9)).pack(anchor="w", pady=(0, 6))
-        for label, name in CONSOLES:
-            b = term_button(body, label, lambda n=name: self.pick_console(n),
-                            width=16, big=True)
-            b.pack(fill="x", pady=5)
+    # ---- console picker ------------------------------------------------------
+    def _build_consoles(self):
+        for i, name in enumerate(CONSOLES):
+            b = NeonButton(self.canvas, 36, 232 + i * 52, 218, 40, name.upper(),
+                           lambda n=name: self.pick_console(n), big=True)
             self.console_btns[name] = b
-
-        tk.Frame(body, bg="#2a3a2e", height=2).pack(fill="x", pady=(14, 10))
-        self.engine_var = tk.StringVar(value="engine: --")
-        tk.Label(body, textvariable=self.engine_var, bg=PANEL, fg=GREEN,
-                 font=("Consolas", 10, "bold")).pack(anchor="w")
-        tk.Label(body, text="(save after tuning)", bg=PANEL, fg="#6f8575",
-                 font=("Consolas", 8)).pack(anchor="w", pady=(2, 0))
+        self.engine_id = self.canvas.create_text(36, 520, anchor="w", text="engine: --",
+                                                 fill=CYAN, font=("Consolas", 10, "bold"))
 
     def pick_console(self, name):
         self.send("use " + name)
         self.send("status")
-        self.active_console = name
         for n, b in self.console_btns.items():
             b.set_active(n == name)
-        self.engine_var.set("engine: " + ("EXT_CLK" if name == "zephyr" else "RGH1.2"))
+        self.canvas.itemconfigure(self.engine_id,
+                                  text="engine: " + ("EXT_CLK" if name == "zephyr" else "RGH1.2"))
 
-    # ---- debug / terminal --------------------------------------------------
-    def _build_debug_panel(self):
-        panel = tk.Frame(self.root, bg=PANEL, highlightthickness=1,
-                         highlightbackground=GREEN_BORDER)
-        panel.place(x=284, y=164, width=596, height=540)
-        head = tk.Frame(panel, bg=PANEL_HEAD, height=30)
-        head.pack(fill="x")
-        tk.Label(head, text="// DEBUG", bg=PANEL_HEAD, fg=GREEN_NEON,
-                 font=("Consolas", 12, "bold")).pack(side="left", padx=10, pady=4)
-        term_button(head, "CLEAR", self.clear, width=7).pack(side="right", padx=8, pady=1)
+    # ---- debug section -------------------------------------------------------
+    def _build_debug(self):
+        NeonButton(self.canvas, 792, 168, 76, 26, "CLEAR", self.clear)
+        x = 298
+        for label, cmd in ACTIONS:
+            w = 78 if cmd == "defaults" else 70
+            NeonButton(self.canvas, x, 208, w, 28, label, lambda c=cmd: self.send(c))
+            x += w + 6
 
-        btns = tk.Frame(panel, bg=PANEL)
-        btns.pack(fill="x", padx=12, pady=(10, 6))
-        for i, (label, cmd) in enumerate(ACTIONS):
-            term_button(btns, label, lambda c=cmd: self.send(c), width=8 if cmd == "defaults" else 7).grid(
-                row=0, column=i, padx=2)
+        self.out = tk.Text(self.root, bg=TERM_BG, fg=TERM_FG, insertbackground=TERM_FG,
+                           font=("Consolas", 10), wrap="word", relief="flat", bd=0,
+                           highlightthickness=0, padx=8, pady=6)
+        self.out.place(x=299, y=249, width=548, height=410)
+        sb = ttk.Scrollbar(self.root, orient="vertical", command=self.out.yview,
+                           style="Neon.Vertical.TScrollbar")
+        sb.place(x=848, y=249, width=17, height=410)
+        self.out.configure(yscrollcommand=sb.set, state="disabled")
 
-        self.out = scrolledtext.ScrolledText(
-            panel, bg=TERM_BG, fg=TERM_FG, insertbackground=TERM_FG,
-            font=("Consolas", 10), wrap="word", relief="flat", bd=0,
-            highlightthickness=1, highlightbackground=GREEN_BORDER)
-        self.out.pack(fill="both", expand=True, padx=12, pady=6)
-        self.out.configure(state="disabled")
-
-        cmd = tk.Frame(panel, bg=PANEL)
-        cmd.pack(fill="x", padx=12, pady=(0, 12))
-        tk.Label(cmd, text=">", bg=PANEL, fg=GREEN,
-                 font=("Consolas", 13, "bold")).pack(side="left")
         self.cmd_var = tk.StringVar()
-        self.entry = tk.Entry(cmd, textvariable=self.cmd_var, bg=TERM_BG,
-                              fg=TERM_FG, insertbackground=TERM_FG,
-                              font=("Consolas", 11), relief="flat",
-                              highlightthickness=1, highlightbackground=GREEN_BORDER)
-        self.entry.pack(side="left", fill="x", expand=True, padx=6, ipady=4)
+        self.entry = tk.Entry(self.root, textvariable=self.cmd_var, bg=ENTRY_BG, fg=TERM_FG,
+                              insertbackground=TERM_FG, font=("Consolas", 11), relief="flat",
+                              bd=0, highlightthickness=0)
+        self.entry.place(x=316, y=672, width=460, height=20)
         self.entry.bind("<Return>", lambda e: self.send_cmd())
-        term_button(cmd, "SEND", self.send_cmd, width=7).pack(side="left")
+        NeonButton(self.canvas, 790, 668, 76, 28, "SEND", self.send_cmd)
 
-    # ---- serial plumbing ---------------------------------------------------
+    # ---- serial plumbing -----------------------------------------------------
     def log(self, text):
         self.out.configure(state="normal")
         self.out.insert("end", text)
@@ -385,10 +297,10 @@ class App:
     def refresh_ports(self, auto_connect=False):
         ports = find_ports()
         self.devices = [d for _, d, _ in ports]
-        self.port_cb["values"] = [f"{d}   {desc}".strip() for _, d, desc in ports]
+        self.port_cb["values"] = [f"{d}  {desc}".strip() for _, d, desc in ports]
         if self.devices:
             self.port_cb.current(0)
-        if auto_connect and ports and ports[0][0] >= 1:
+        if auto_connect is True and ports and ports[0][0] >= 1 and not self.ser:
             self.connect()
 
     def toggle(self):
@@ -397,19 +309,19 @@ class App:
     def connect(self):
         idx = self.port_cb.current()
         if idx < 0 or idx >= len(self.devices):
-            self.status_var.set("no port selected")
+            self.set_status("no port selected", False)
             return
         dev = self.devices[idx]
         try:
             self.ser = serial.Serial(dev, 115200, timeout=0.1)
         except Exception as e:
-            self.status_var.set(f"error: {e}")
+            self.set_status(f"error: {e}"[:44], False)
             self.ser = None
             return
         self.stop.clear()
         threading.Thread(target=self._read_loop, daemon=True).start()
-        self.status_var.set(f"connected {dev}")
-        self.connect_btn.configure(text="DISCONNECT")
+        self.set_status(f"connected {dev}", True)
+        self.connect_btn.set_text("DISCONNECT")
         self.log(f"\n--- connected to {dev} ---\n")
         self.send("")
 
@@ -421,8 +333,8 @@ class App:
             except Exception:
                 pass
         self.ser = None
-        self.status_var.set("not connected")
-        self.connect_btn.configure(text="CONNECT")
+        self.set_status("not connected", False)
+        self.connect_btn.set_text("CONNECT")
 
     def _read_loop(self):
         while not self.stop.is_set() and self.ser:
@@ -444,12 +356,12 @@ class App:
 
     def send(self, cmd):
         if not self.ser:
-            self.status_var.set("not connected")
+            self.set_status("not connected", False)
             return
         try:
             self.ser.write((cmd + "\r\n").encode())
         except Exception as e:
-            self.status_var.set(f"write error: {e}")
+            self.set_status(f"write error: {e}"[:44], False)
 
     def send_cmd(self):
         self.send(self.cmd_var.get())

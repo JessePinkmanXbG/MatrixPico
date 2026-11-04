@@ -24,7 +24,7 @@ jobs:
         run: pip install pyserial pillow pyinstaller
 
       - name: Build exe
-        run: pyinstaller --onefile --windowed --name MatrixPicoConsole tools/matrixpico_console.py
+        run: pyinstaller --onefile --windowed --name MatrixPicoConsole --add-data "tools/assets/bg.png;assets" --add-data "tools/assets/Inter-ExtraBoldItalic.otf;assets" tools/matrixpico_console.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
