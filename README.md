@@ -109,6 +109,7 @@ Select a profile with `use <name>`; each carries its own method and timings.
 | corona | RGH 1.2 | seeded — [tune it](docs/CORONA.md) |
 | falcon / jasper | RGH 1.2 | seeded — tune like Corona |
 | zephyr | EXT_CLK | experimental — [hardware-test build](docs/ZEPHYR_EXTCLK.md) |
+| xenon | EXT_CLK | experimental, same engine as zephyr; only `r_end` differs (118002), untested |
 
 RGH 1.2 and EXT_CLK are separate PIO engines; the firmware loads the right one
 for the active profile. On every method the reset line is open-drain (pulled

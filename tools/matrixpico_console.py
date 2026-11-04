@@ -30,7 +30,7 @@ TERM_FG = "#39ff14"
 ENTRY_BG = "#02061a"
 BORDER = "#00aae6"
 
-CONSOLES = ["trinity", "corona", "falcon", "jasper", "zephyr"]
+CONSOLES = ["trinity", "corona", "falcon", "jasper", "zephyr", "xenon"]
 ACTIONS = [("STATUS", "status"), ("LIST", "list"), ("MON", "mon"),
            ("SAVE", "save"), ("LOAD", "load"), ("DEFAULTS", "defaults"),
            ("HELP", "help")]
@@ -242,10 +242,10 @@ class App:
     # ---- console picker ------------------------------------------------------
     def _build_consoles(self):
         for i, name in enumerate(CONSOLES):
-            b = NeonButton(self.canvas, 36, 232 + i * 52, 218, 40, name.upper(),
+            b = NeonButton(self.canvas, 36, 232 + i * 46, 218, 38, name.upper(),
                            lambda n=name: self.pick_console(n), big=True)
             self.console_btns[name] = b
-        self.engine_id = self.canvas.create_text(36, 520, anchor="w", text="engine: --",
+        self.engine_id = self.canvas.create_text(36, 548, anchor="w", text="engine: --",
                                                  fill=CYAN, font=("Consolas", 10, "bold"))
 
     def pick_console(self, name):
@@ -254,7 +254,7 @@ class App:
         for n, b in self.console_btns.items():
             b.set_active(n == name)
         self.canvas.itemconfigure(self.engine_id,
-                                  text="engine: " + ("EXT_CLK" if name == "zephyr" else "RGH1.2"))
+                                  text="engine: " + ("EXT_CLK" if name in ("zephyr", "xenon") else "RGH1.2"))
 
     # ---- debug section -------------------------------------------------------
     def _build_debug(self):

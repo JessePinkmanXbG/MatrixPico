@@ -1,5 +1,8 @@
 # Zephyr / Xenon — EXT_CLK (experimental)
 
+Both `zephyr` and `xenon` profiles use this engine. Xenon differs only in `r_end` (118002 vs 118008 at 192 MHz, per Octal450's VHDL).
+
+
 EXT_CLK is the method for the early phat consoles (Xenon, Zephyr) that don't
 glitch reliably on plain RGH 1.2. Matrix Pico's `zephyr` profile uses a
 separate PIO engine (`extclk.pio`) for it.

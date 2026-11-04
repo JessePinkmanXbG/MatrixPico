@@ -77,9 +77,11 @@
 
 /* ---- Profiles ----------------------------------------------------------- */
 #define NUM_TIMINGS     5
-#define NUM_PROFILES    5
+#define NUM_PROFILES    6
 #define PROFILE_NAME_LEN 16
-#define CONFIG_MAGIC    0x4D505835u   /* "MPX5" - bump if layout/clock changes */
+#define CONFIG_MAGIC    0x4D505836u   /* "MPX6" - bump if layout/clock changes */
+#define CONFIG_MAGIC_V5 0x4D505835u   /* "MPX5" - 5-profile layout, migrated on load */
+#define NUM_PROFILES_V5 5
 #define CONFIG_VERSION  1
 
 /* Timing value meanings (index -> role), same order they are fed to the PIO:
@@ -125,6 +127,8 @@ typedef struct {
     profile_t profiles[NUM_PROFILES];
 } config_t;
 
+_Static_assert(sizeof(config_t) <= 256, "config must fit one flash page");
+
 /* Built-in defaults.
  *
  * "trinity" carries the original author's real Trinity RGH 1.2 values, so it
@@ -148,6 +152,9 @@ static const config_t DEFAULT_CONFIG = {
          * pulse 2, slow_delay ~382ms (73,344,000 cyc), T_BUF 50000, ~12 pulses.
          * These are STRUCTURAL SEEDS - must be dialed in on hardware. */
         { "zephyr",  METHOD_EXTCLK, { 12, 73344000, 118008, 2, 50000 } },     /* dial in */
+        /* Xenon: same EXT_CLK engine; Octal450's VHDL differs from Zephyr only in
+         * R_END (118002 vs 118008 @192MHz). Untested - seed, dial in with sweep. */
+        { "xenon",   METHOD_EXTCLK, { 12, 73344000, 118002, 2, 50000 } },     /* dial in */
     },
 };
 
@@ -183,6 +190,12 @@ static void config_load(void)
     if (fc->magic == CONFIG_MAGIC && fc->version == CONFIG_VERSION &&
         fc->active < NUM_PROFILES) {
         memcpy(&g_cfg, fc, sizeof(config_t));
+    } else if (fc->magic == CONFIG_MAGIC_V5 && fc->version == CONFIG_VERSION &&
+               fc->active < NUM_PROFILES_V5) {
+        /* Old 5-profile save: keep the user's tuned profiles, add the new ones. */
+        memcpy(&g_cfg, &DEFAULT_CONFIG, sizeof(config_t));
+        g_cfg.active = fc->active;
+        memcpy(g_cfg.profiles, fc->profiles, NUM_PROFILES_V5 * sizeof(profile_t));
     } else {
         memcpy(&g_cfg, &DEFAULT_CONFIG, sizeof(config_t));
     }
