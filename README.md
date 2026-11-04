@@ -30,9 +30,12 @@ runs headless inside the console with no PC attached.
 | 3V3      | switched 3.3V         | a rail that is live only when the console is **on** |
 | GND      | GND                   |                                                   |
 
-No diodes are needed on Slim/Corona. Feed the motherboard's 3.3V into the
-Pico's **3V3 pin**, not 5V/VSYS. Point locations differ per motherboard — look
-up the RGH 1.2 points for your specific revision.
+Feed the motherboard's 3.3V into the Pico's **3V3 pin**, not 5V/VSYS. Point
+locations differ per motherboard — look up the RGH 1.2 points for your
+revision. The reset line is pure open-drain (never driven to 3.3V), so no
+clamp diode is needed for the reset net. **Read [docs/SAFETY.md](docs/SAFETY.md)
+before wiring** — the series resistor and the power rules there protect the
+console.
 
 RGH 1.2 via PLL bypass is the right method for **Trinity, Corona, Falcon and
 Jasper**. **Xenon and Zephyr** are unreliable on plain RGH 1.2 and want the

@@ -348,6 +348,16 @@ static void core1_main(void)
     led_init();
     led_off();
 
+    /* Safety: drive the slowdown line (PLL_BYPASS / EXT_CLK_EN) to its inactive
+     * LOW state from the very start, so it is never left floating at the console
+     * during the window before the first arm. The reset pin stays an input
+     * (floating) - it must never source voltage into the 1.1V net. */
+    gpio_init(PLL_BYPASS);
+    gpio_put(PLL_BYPASS, 0);
+    gpio_set_dir(PLL_BYPASS, GPIO_OUT);
+    gpio_init(CPU_RESET);
+    gpio_set_dir(CPU_RESET, GPIO_IN);
+
     PIO pio = pio0;
     uint sm = 0;
     int loaded = -1;

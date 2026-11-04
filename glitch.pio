@@ -11,13 +11,15 @@
 ;   bit 0 = CPU_RESET  (output latch held at 0; we switch its DIRECTION)
 ;   bit 1 = PLL_BYPASS (normal push-pull output)
 ;
-; Safety: the CPU reset line is a 1.1V net. The original program held it
-; driven HIGH at 3.3V for the whole glitch window (most of a second per
-; attempt). Here it is left floating (input / hi-Z) at all times except:
-;   - the glitch pulse itself, where it is pulled LOW, and
-;   - exactly ONE cycle of drive-high afterwards (RGH needs the line pulled
-;     up immediately rather than drifting), then back to floating.
-; At 192 MHz that one cycle is ~5 ns, mirroring what the Matrix CPLD does.
+; Safety: the CPU reset line is a 1.1V net. The original PicoRGH program held
+; it driven HIGH at 3.3V for the whole glitch window (most of a second per
+; attempt). This version is PURE OPEN-DRAIN: the reset pin is only ever an
+; output to pull LOW (the glitch), otherwise it is an input (floating). It is
+; NEVER driven high, so no 3.3V ever reaches the 1.1V reset net - the line
+; returns high through the console's own pull-up. Same behaviour as the
+; EXT_CLK engine. (If a console will not boot reliably open-drain, the CPLD
+; trick of a 1-cycle pull-up can be restored, but it is off by default because
+; it puts 3.3V on a 1.1V net.)
 ;
 ; POST is read on GPIO 28 (hard-coded below; keep in sync with main.c).
 
@@ -52,9 +54,7 @@ delay_rst:
 hold_rst:
 	jmp y-- hold_rst
 
-	set pins, 0b11              ; reset driven HIGH for one cycle only
-	set pindirs, 0b10           ; reset back to floating
-	set pins, 0b10              ; reset latch back to 0 (no effect while floating)
+	set pindirs, 0b10           ; reset back to INPUT -> FLOAT (open-drain, no 3.3V)
 
 	pull block                  ; x = pll_hold
 	mov x, osr
