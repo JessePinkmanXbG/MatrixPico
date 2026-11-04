@@ -29,9 +29,13 @@ guard against on this method.
 |---|---|---|
 | GP26 | /CPU_RST_1V1P_N (reset pulse out) | open-drain, 1.1V — only ever pulled low |
 | GP27 | CPU_EXT_CLK_EN | the slowdown line (same pin RGH 1.2 uses for PLL) |
-| GP28 | POST bit 0 (FT6U1) | **1.1V — see the signal-level note below** |
+| GP28 | POST bit 0 (FT6U1) | 1.1V — safe to wire direct; may not *read* (below) |
 | GP29 | a **3.3V** reset-done point | arm sense; Zephyr is "a Falcon with a Waternoose", so use the Falcon/Jasper reset-sense point |
+| 3V3 | a **switched 3.3V** point | same as the Slim — into the Pico's 3V3 pin |
 | GND | GND | |
+
+Power from a switched 3.3V exactly like Trinity/Corona. Standby 5V is only a
+first-attempt reliability tweak, not required.
 
 Source for the points: EXT_CLK/EXT+3 install notes (A=/CPU_RST_1V1P_N,
 B=POST bit 0, C=STBY_CLK, F=CPU_EXT_CLK_EN).

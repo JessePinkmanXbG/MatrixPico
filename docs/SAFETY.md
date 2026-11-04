@@ -30,9 +30,17 @@ console over time, and the wiring rules that keep it safe.
   from the console's standby 5V — on a full Pico, via a diode into VSYS so USB
   can still be connected later without backfeed.
 - **Feed console 3.3V into the Pico's 3V3 pin, not 5V/VSYS.**
-- **Phat POST (1.1V) reads through a small-signal diode into GP28** with the
-  Pico's internal pull-up. This is about reading POST reliably; it also keeps
-  the Pico from loading the 1.1V POST net.
+- **POST (GP28) is safe to wire directly, no diode.** GP28 is a pure
+  high-impedance input (input enabled, pulls off, never driven), so it only
+  sinks ~uA of leakage and cannot drive or load the POST net on any console.
+  Wiring it straight is electrically harmless.
+    - *Reading* is the catch, and it is silicon, not firmware: the Pico's input
+      high-threshold is ~1.5V. Slim POST (Trinity/Corona) reads fine on wires.
+      Phat POST (Xenon/Zephyr/Falcon/Jasper) is ~1.1V, which is **below** that
+      threshold, so it often reads as always-low on a bare wire. If `mon` shows
+      POST stuck low on a phat board, a small-signal diode into GP28 (with a
+      pull-up) is the level-shift that makes it readable - the only place wires
+      alone may fall short, and no firmware can change the threshold.
 - **Keep the reset wire short.** Noise on it costs boot reliability.
 
 ## The one trade-off

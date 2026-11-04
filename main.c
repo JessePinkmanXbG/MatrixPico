@@ -592,7 +592,13 @@ int main(void)
 
     stdio_init_all();      /* USB CDC serial console */
 
-    gpio_set_input_enabled(POST_PIN, true);  /* so 'mon' can read POST too */
+    /* POST is a pure high-impedance input: input enabled, pulls OFF, never
+     * driven. So wiring GP28 straight to a 1.1V POST net is electrically safe
+     * with no diode - the Pico only sinks input leakage (~uA), it cannot drive
+     * or load the net. (Whether a 1.1V high READS is a separate question - see
+     * docs/SAFETY.md; on phat it is below the Pico's threshold.) */
+    gpio_set_input_enabled(POST_PIN, true);
+    gpio_disable_pulls(POST_PIN);
 
     config_load();
 
