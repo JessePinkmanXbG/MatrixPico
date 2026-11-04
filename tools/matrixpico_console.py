@@ -279,8 +279,6 @@ class App:
                                        fill=shades[r], outline="#0a3d14")  # block
                     c.create_line(x + 1, y + 1, x + cell - 1, y + 1, fill="#c8ffc8")  # top bevel
                     c.create_line(x + 1, y + 1, x + 1, y + cell - 1, fill="#9dffa0")  # left bevel
-        c.create_text(450, 90, text="R G H   G L I T C H E R   C O N S O L E",
-                      font=("Consolas", 10, "bold"), fill="#7fb08a")
 
     # ---- connection bar ----------------------------------------------------
     def _build_connection(self):
