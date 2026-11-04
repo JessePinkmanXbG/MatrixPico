@@ -68,15 +68,134 @@ def find_ports():
     return out
 
 
+try:
+    from PIL import Image, ImageDraw, ImageChops, ImageTk
+    HAVE_PIL = True
+except Exception:
+    HAVE_PIL = False
+
+# glossy pill palettes: (top, bottom, border)
+PALETTES = {
+    "normal": ((22, 226, 118), (0, 255, 130), (16, 122, 60)),
+    "hover":  ((70, 245, 150), (40, 255, 160), (16, 122, 60)),
+    "press":  ((0, 190, 90),   (0, 215, 105),  (10, 90, 40)),
+    "active": ((0, 150, 60),   (0, 190, 85),   (255, 255, 255)),
+}
+_pill_cache = {}
+
+
+def make_pill(w, h, state):
+    key = (w, h, state)
+    if key in _pill_cache:
+        return _pill_cache[key]
+    S = 4
+    W, H = w * S, h * S
+    top, bot, border = PALETTES[state]
+    outer = Image.new("L", (W, H), 0)
+    ImageDraw.Draw(outer).rounded_rectangle([0, 0, W - 1, H - 1], radius=H // 2, fill=255)
+    b = 2 * S
+    inner = Image.new("L", (W, H), 0)
+    ImageDraw.Draw(inner).rounded_rectangle([b, b, W - 1 - b, H - 1 - b],
+                                            radius=(H - 2 * b) // 2, fill=255)
+    img = Image.new("RGB", (W, H), border)
+    grad = Image.new("RGB", (W, H))
+    gd = ImageDraw.Draw(grad)
+    for y in range(H):
+        t = y / (H - 1)
+        gd.line([(0, y), (W, y)],
+                fill=tuple(int(top[i] + (bot[i] - top[i]) * t) for i in range(3)))
+    img.paste(grad, (0, 0), inner)
+    # glossy highlight on the upper half
+    ins = 4 * S
+    gh = int(H * 0.50)
+    shape = Image.new("L", (W, H), 0)
+    ImageDraw.Draw(shape).rounded_rectangle([ins, b + S, W - 1 - ins, gh],
+                                            radius=(gh - b) // 2, fill=255)
+    fade = Image.new("L", (W, H), 0)
+    fd = ImageDraw.Draw(fade)
+    for y in range(H):
+        fd.line([(0, y), (W, y)], fill=max(0, int(190 * (1 - y / gh))) if y < gh else 0)
+    gloss = ImageChops.multiply(shape, fade)
+    img.paste(Image.new("RGB", (W, H), (235, 255, 240)), (0, 0), gloss)
+    out = img.convert("RGBA")
+    out.putalpha(outer)
+    out = out.resize((w, h), Image.LANCZOS)
+    photo = ImageTk.PhotoImage(out)
+    _pill_cache[key] = photo
+    return photo
+
+
+class GlossButton(tk.Canvas):
+    """Round glossy green pill button (drawn with Pillow, text via canvas)."""
+
+    def __init__(self, parent, text, command, width=10, big=False):
+        self.w = width * (10 if big else 8) + (30 if big else 18)
+        self.h = 40 if big else 28
+        super().__init__(parent, width=self.w, height=self.h,
+                         bg=parent.cget("bg"), highlightthickness=0, bd=0,
+                         cursor="hand2")
+        self.text, self.command = text, command
+        self.font = ("Consolas", 12 if big else 10, "bold")
+        self.active = False
+        self.hover = False
+        self.pressed = False
+        self.bind("<Configure>", lambda e: self._draw())
+        self.bind("<Enter>", lambda e: self._set(hover=True))
+        self.bind("<Leave>", lambda e: self._set(hover=False, pressed=False))
+        self.bind("<ButtonPress-1>", lambda e: self._set(pressed=True))
+        self.bind("<ButtonRelease-1>", self._release)
+        self._draw()
+
+    def _set(self, **kw):
+        for k, v in kw.items():
+            setattr(self, k, v)
+        self._draw()
+
+    def _release(self, e):
+        was = self.pressed
+        self._set(pressed=False)
+        if was and 0 <= e.x <= self.winfo_width() and 0 <= e.y <= self.winfo_height():
+            self.command()
+
+    def set_active(self, flag):
+        self.active = flag
+        self._draw()
+
+    def _draw(self):
+        w = max(self.winfo_width(), 2)
+        h = max(self.winfo_height(), 2)
+        if w < 20:
+            w, h = self.w, self.h
+        state = ("press" if self.pressed else "active" if self.active
+                 else "hover" if self.hover else "normal")
+        self._img = make_pill(w, h, state)
+        self.delete("all")
+        self.create_image(0, 0, image=self._img, anchor="nw")
+        dy = 1 if self.pressed else 0
+        self.create_text(w // 2 + 1, h // 2 + 1 + dy, text=self.text,
+                         font=self.font, fill="#0a4a22")
+        self.create_text(w // 2, h // 2 + dy, text=self.text,
+                         font=self.font, fill="#ffffff")
+
+
+class FlatButton(tk.Button):
+    """Fallback when Pillow is unavailable."""
+
+    def set_active(self, flag):
+        self.configure(bg="#39ff14" if flag else "#0d0d0d",
+                       fg="#061006" if flag else GREEN_NEON)
+
+
 def term_button(parent, text, cmd, width=10, big=False):
-    return tk.Button(
+    if HAVE_PIL:
+        return GlossButton(parent, text, cmd, width, big)
+    return FlatButton(
         parent, text=text, command=cmd, cursor="hand2",
         bg="#0d0d0d", fg=GREEN_NEON,
         activebackground=GREEN_DK, activeforeground="#7CFC00",
         font=("Consolas", 12 if big else 10, "bold"),
         relief="flat", bd=0, highlightthickness=1,
-        highlightbackground=GREEN_BORDER, highlightcolor=GREEN_BORDER,
-        padx=6, pady=6 if big else 3, width=width)
+        highlightbackground=GREEN_BORDER, padx=6, pady=6 if big else 3, width=width)
 
 
 class App:
@@ -174,9 +293,9 @@ class App:
         self.port_cb = ttk.Combobox(bar, textvariable=self.port_var, width=26,
                                     state="readonly")
         self.port_cb.place(x=62, y=11, width=250)
-        term_button(bar, "REFRESH", self.refresh_ports, width=9).place(x=324, y=7)
+        term_button(bar, "REFRESH", self.refresh_ports, width=9).place(x=324, y=9)
         self.connect_btn = term_button(bar, "CONNECT", self.toggle, width=10)
-        self.connect_btn.place(x=438, y=7)
+        self.connect_btn.place(x=438, y=9)
         self.status_var = tk.StringVar(value="not connected")
         tk.Label(bar, textvariable=self.status_var, bg=PANEL, fg="#8a1f1f",
                  font=("Consolas", 10, "bold")).place(x=560, y=12)
@@ -213,10 +332,7 @@ class App:
         self.send("status")
         self.active_console = name
         for n, b in self.console_btns.items():
-            if n == name:
-                b.configure(bg=GREEN_NEON, fg="#061006")
-            else:
-                b.configure(bg="#0d0d0d", fg=GREEN_NEON)
+            b.set_active(n == name)
         self.engine_var.set("engine: " + ("EXT_CLK" if name == "zephyr" else "RGH1.2"))
 
     # ---- debug / terminal --------------------------------------------------
@@ -228,15 +344,12 @@ class App:
         head.pack(fill="x")
         tk.Label(head, text="// DEBUG", bg=PANEL_HEAD, fg=GREEN_NEON,
                  font=("Consolas", 12, "bold")).pack(side="left", padx=10, pady=4)
-        tk.Button(head, text="CLEAR", command=self.clear, cursor="hand2",
-                  bg=PANEL_HEAD, fg="#9aa", activebackground="#333",
-                  font=("Consolas", 9, "bold"), relief="flat", bd=0).pack(
-                      side="right", padx=8)
+        term_button(head, "CLEAR", self.clear, width=7).pack(side="right", padx=8, pady=1)
 
         btns = tk.Frame(panel, bg=PANEL)
         btns.pack(fill="x", padx=12, pady=(10, 6))
         for i, (label, cmd) in enumerate(ACTIONS):
-            term_button(btns, label, lambda c=cmd: self.send(c), width=8).grid(
+            term_button(btns, label, lambda c=cmd: self.send(c), width=8 if cmd == "defaults" else 7).grid(
                 row=0, column=i, padx=2)
 
         self.out = scrolledtext.ScrolledText(

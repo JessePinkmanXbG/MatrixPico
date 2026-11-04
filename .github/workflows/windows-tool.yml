@@ -21,7 +21,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install deps
-        run: pip install pyserial pyinstaller
+        run: pip install pyserial pillow pyinstaller
 
       - name: Build exe
         run: pyinstaller --onefile --windowed --name MatrixPicoConsole tools/matrixpico_console.py
