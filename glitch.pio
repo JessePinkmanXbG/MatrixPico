@@ -25,8 +25,8 @@
 	mov y, osr                  side 0x1
 
 wait_for_post_loop:
-	wait 1 GPIO 15              side 0x1
-	wait 0 GPIO 15              side 0x1
+	wait 1 GPIO 28              side 0x1
+	wait 0 GPIO 28              side 0x1
 	jmp x-- wait_for_post_loop  side 0x1
 
 delay_pll:
@@ -37,7 +37,7 @@ delay_pll:
 	pull                        side 0x3
 	mov y, osr                  side 0x3
 
-	wait 1 GPIO 15              side 0x3
+	wait 1 GPIO 28              side 0x3
 
 delay_rst: ;
 	jmp x-- delay_rst           side 0x3

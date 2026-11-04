@@ -49,19 +49,19 @@
 #endif
 
 /* ---- Motherboard wiring (Pico GPIO -> Xbox 360 point) -------------------
- * GP11 -> CPU_RESET      (glitch pulse)
- * GP12 -> CPU_PLL_BYPASS (series resistor: 5-10K on Slim, 22K on Phat)
- * GP15 -> POST           (bit monitored; referenced as GPIO 15 in glitch.pio)
+ * GP26 -> CPU_RESET      (glitch pulse)
+ * GP27 -> CPU_PLL_BYPASS (series resistor: 5-10K on Slim, 22K on Phat)
+ * GP28 -> POST           (bit monitored; referenced as GPIO 28 in glitch.pio)
  * GP16 -> onboard WS2812 (RP2040-Zero): blue = glitching, green = booted.
  *                          Classic Pico: set USE_WS2812 0 to use GP25.
  * 3V3 / GND -> switched 3.3V and ground
  *
- * POST is hard-coded to GPIO 15 inside glitch.pio. If you move it, change it
+ * POST is hard-coded to GPIO 28 inside glitch.pio. If you move it, change it
  * in BOTH places.
  * ------------------------------------------------------------------------ */
-#define CPU_RESET   11
-#define PLL_BYPASS  12
-#define POST_PIN    15
+#define CPU_RESET   26
+#define PLL_BYPASS  27
+#define POST_PIN    28
 
 #define MP_SYS_CLK_KHZ 266000
 
