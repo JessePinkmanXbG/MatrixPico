@@ -246,8 +246,21 @@ static void run_glitch_once(PIO pio, uint sm, uint offset)
     bool shown = false;
     while (gpio_get(CPU_RESET)) {
         if (!shown && absolute_time_diff_us(t0, get_absolute_time()) > 1500000) {
-            led_green();
-            sleep_ms(1500);
+            /* boot confirmed: flash blue 5s, then flash green 5s, then off */
+            absolute_time_t s0 = get_absolute_time();
+            while (absolute_time_diff_us(s0, get_absolute_time()) < 5000000) {
+                led_blue();
+                sleep_ms(100);
+                led_off();
+                sleep_ms(100);
+            }
+            s0 = get_absolute_time();
+            while (absolute_time_diff_us(s0, get_absolute_time()) < 5000000) {
+                led_green();
+                sleep_ms(100);
+                led_off();
+                sleep_ms(100);
+            }
             led_off();
             shown = true;
         }
