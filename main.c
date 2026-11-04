@@ -314,6 +314,7 @@ static void print_help(void)
         "  load                 reload profiles from flash (discard edits)\n"
         "  defaults             restore built-in defaults (not saved yet)\n"
         "  attempts             reset the attempt counter\n"
+        "  mon                  watch CPU_RESET/POST live for 6s (power-cycle to test)\n"
         "timing index: 0 post_count  1 delay_to_pll  2 delay_to_rst\n"
         "              3 glitch_width 4 pll_hold\n");
 }
@@ -382,6 +383,21 @@ static void handle_line(char *line)
     } else if (!strcmp(cmd, "attempts")) {
         g_attempts = 0;
         printf("attempt counter reset.\n");
+    } else if (!strcmp(cmd, "mon")) {
+        printf("monitoring pins for 6s - power-cycle the console now...\n");
+        bool rh = false, rl = false, ph = false, pl = false;
+        absolute_time_t t0 = get_absolute_time();
+        while (absolute_time_diff_us(t0, get_absolute_time()) < 6000000) {
+            if (gpio_get(CPU_RESET)) rh = true; else rl = true;
+            if (gpio_get(POST_PIN))  ph = true; else pl = true;
+            sleep_ms(1);
+        }
+        printf("CPU_RESET(26): %s\n",
+               (rh && rl) ? "TOGGLED  (seen high & low - wire good)" :
+               (rh ? "always HIGH" : "always LOW  (not seeing the console)"));
+        printf("POST(28):      %s\n",
+               (ph && pl) ? "TOGGLED  (seen high & low - wire good)" :
+               (ph ? "always HIGH (stuck)" : "always LOW  (no POST - check this wire)"));
     } else {
         printf("err: unknown command '%s' (try 'help')\n", cmd);
     }
@@ -424,6 +440,8 @@ int main(void)
                     freq, freq);
 
     stdio_init_all();      /* USB CDC serial console */
+
+    gpio_set_input_enabled(POST_PIN, true);  /* so 'mon' can read POST too */
 
     config_load();
 
