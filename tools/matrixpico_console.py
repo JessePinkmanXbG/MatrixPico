@@ -20,18 +20,18 @@ import serial.tools.list_ports
 RP2040_VID = 0x2E8A
 
 # ---- palette --------------------------------------------------------------
-SILVER_TOP   = (0xEC, 0xEE, 0xF2)
-SILVER_MID   = (0xC2, 0xC6, 0xCC)
-SILVER_LOW   = (0xDC, 0xDF, 0xE4)
-SILVER_BOT   = (0xBC, 0xC0, 0xC6)
+SILVER_TOP   = (0x26, 0x2C, 0x2E)
+SILVER_MID   = (0x0E, 0x11, 0x12)
+SILVER_LOW   = (0x15, 0x19, 0x1A)
+SILVER_BOT   = (0x05, 0x07, 0x07)
 
 GREEN        = "#2ecc40"
 GREEN_NEON   = "#39ff14"
 GREEN_DK     = "#0a2a0a"
 GREEN_BORDER = "#1f7a1f"
-INK          = "#121512"
-PANEL        = "#e7e9ed"
-PANEL_HEAD   = "#1b1f1b"
+INK          = "#d6f5dc"
+PANEL        = "#14191a"
+PANEL_HEAD   = "#0a0d0d"
 TERM_BG      = "#050805"
 TERM_FG      = "#33ff33"
 
@@ -204,7 +204,7 @@ class App:
         root.title("MatrixPico")
         root.geometry("900x720")
         root.minsize(900, 720)
-        root.configure(bg="#c9cdd3")
+        root.configure(bg="#0e1112")
 
         self.ser = None
         self.stop = threading.Event()
@@ -242,7 +242,7 @@ class App:
             c.create_line(0, i, w, i, fill="#%02x%02x%02x" % col, tags="bgfill")
         # diagonal sheen
         c.create_polygon(0, 0, int(w * 0.42), 0, 0, int(h * 0.55),
-                         fill="#f2f3f6", outline="", stipple="gray25", tags="bgfill")
+                         fill="#2f383a", outline="", stipple="gray25", tags="bgfill")
         c.tag_lower("bgfill")
 
     def _build_logo(self):
@@ -274,13 +274,13 @@ class App:
                         continue
                     x, y = lx + col * cell, y0 + r * cell
                     c.create_rectangle(x + 3, y + 3, x + cell + 3, y + cell + 3,
-                                       fill="#1c2a1c", outline="")          # drop shadow
+                                       fill="#000000", outline="")          # drop shadow
                     c.create_rectangle(x, y, x + cell, y + cell,
                                        fill=shades[r], outline="#0a3d14")  # block
                     c.create_line(x + 1, y + 1, x + cell - 1, y + 1, fill="#c8ffc8")  # top bevel
                     c.create_line(x + 1, y + 1, x + 1, y + cell - 1, fill="#9dffa0")  # left bevel
         c.create_text(450, 90, text="R G H   G L I T C H E R   C O N S O L E",
-                      font=("Consolas", 10, "bold"), fill="#2c3a2c")
+                      font=("Consolas", 10, "bold"), fill="#7fb08a")
 
     # ---- connection bar ----------------------------------------------------
     def _build_connection(self):
@@ -297,7 +297,7 @@ class App:
         self.connect_btn = term_button(bar, "CONNECT", self.toggle, width=10)
         self.connect_btn.place(x=438, y=9)
         self.status_var = tk.StringVar(value="not connected")
-        tk.Label(bar, textvariable=self.status_var, bg=PANEL, fg="#8a1f1f",
+        tk.Label(bar, textvariable=self.status_var, bg=PANEL, fg="#ff5a5a",
                  font=("Consolas", 10, "bold")).place(x=560, y=12)
 
     # ---- console picker ----------------------------------------------------
@@ -312,7 +312,7 @@ class App:
 
         body = tk.Frame(panel, bg=PANEL)
         body.pack(fill="both", expand=True, padx=14, pady=12)
-        tk.Label(body, text="select a board:", bg=PANEL, fg="#333",
+        tk.Label(body, text="select a board:", bg=PANEL, fg="#9fb8a5",
                  font=("Consolas", 9)).pack(anchor="w", pady=(0, 6))
         for label, name in CONSOLES:
             b = term_button(body, label, lambda n=name: self.pick_console(n),
@@ -320,11 +320,11 @@ class App:
             b.pack(fill="x", pady=5)
             self.console_btns[name] = b
 
-        tk.Frame(body, bg="#c7cbd1", height=2).pack(fill="x", pady=(14, 10))
+        tk.Frame(body, bg="#2a3a2e", height=2).pack(fill="x", pady=(14, 10))
         self.engine_var = tk.StringVar(value="engine: --")
-        tk.Label(body, textvariable=self.engine_var, bg=PANEL, fg=GREEN_BORDER,
+        tk.Label(body, textvariable=self.engine_var, bg=PANEL, fg=GREEN,
                  font=("Consolas", 10, "bold")).pack(anchor="w")
-        tk.Label(body, text="(save after tuning)", bg=PANEL, fg="#777",
+        tk.Label(body, text="(save after tuning)", bg=PANEL, fg="#6f8575",
                  font=("Consolas", 8)).pack(anchor="w", pady=(2, 0))
 
     def pick_console(self, name):
@@ -361,7 +361,7 @@ class App:
 
         cmd = tk.Frame(panel, bg=PANEL)
         cmd.pack(fill="x", padx=12, pady=(0, 12))
-        tk.Label(cmd, text=">", bg=PANEL, fg=GREEN_BORDER,
+        tk.Label(cmd, text=">", bg=PANEL, fg=GREEN,
                  font=("Consolas", 13, "bold")).pack(side="left")
         self.cmd_var = tk.StringVar()
         self.entry = tk.Entry(cmd, textvariable=self.cmd_var, bg=TERM_BG,
