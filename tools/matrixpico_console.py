@@ -76,10 +76,10 @@ except Exception:
 
 # glossy pill palettes: (top, bottom, border)
 PALETTES = {
-    "normal": ((22, 226, 118), (0, 255, 130), (16, 122, 60)),
-    "hover":  ((70, 245, 150), (40, 255, 160), (16, 122, 60)),
-    "press":  ((0, 190, 90),   (0, 215, 105),  (10, 90, 40)),
-    "active": ((0, 150, 60),   (0, 190, 85),   (255, 255, 255)),
+    "normal": ((14, 170, 88),  (0, 200, 100),  (10, 92, 46)),
+    "hover":  ((40, 200, 115), (20, 225, 125), (10, 92, 46)),
+    "press":  ((0, 135, 66),   (0, 160, 78),   (6, 66, 30)),
+    "active": ((0, 112, 46),   (0, 148, 66),   (255, 255, 255)),
 }
 _pill_cache = {}
 
@@ -114,9 +114,9 @@ def make_pill(w, h, state):
     fade = Image.new("L", (W, H), 0)
     fd = ImageDraw.Draw(fade)
     for y in range(H):
-        fd.line([(0, y), (W, y)], fill=max(0, int(190 * (1 - y / gh))) if y < gh else 0)
+        fd.line([(0, y), (W, y)], fill=max(0, int(150 * (1 - y / gh))) if y < gh else 0)
     gloss = ImageChops.multiply(shape, fade)
-    img.paste(Image.new("RGB", (W, H), (235, 255, 240)), (0, 0), gloss)
+    img.paste(Image.new("RGB", (W, H), (225, 255, 235)), (0, 0), gloss)
     out = img.convert("RGBA")
     out.putalpha(outer)
     out = out.resize((w, h), Image.LANCZOS)
