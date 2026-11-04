@@ -143,9 +143,14 @@ def logo(img):
     chip_rp2040(img, int(x0 + 9 + 40), 54)
     tx = sc(x0 + chip_w + gap)
     cy = sc(54)
-    def g(dd, c): dd.text((tx, cy), "MATRIXPICO", font=f, fill=c, anchor="lm")
+    wm = f.getlength("MATRIX")
+    def g(dd, c): dd.text((tx, cy), "MATRIX", font=f, fill=c, anchor="lm")
     glow(img, g, (30, 255, 110, 255), 11, 1.3)
-    paste_grad_text(img, (tx, cy), "MATRIXPICO", f, [(0, (200, 255, 220)), (0.45, (40, 240, 120)), (1, (0, 130, 55))],
+    def g2(dd, c): dd.text((tx + wm, cy), "PICO", font=f, fill=c, anchor="lm")
+    glow(img, g2, (190, 205, 220, 255), 9, 0.9)
+    paste_grad_text(img, (tx, cy), "MATRIX", f, [(0, (200, 255, 220)), (0.45, (40, 240, 120)), (1, (0, 130, 55))],
+                    anchor="lm", shadow=((sc(2), sc(3)), (0, 0, 0, 210)))
+    paste_grad_text(img, (tx + wm, cy), "PICO", f, [(0, (250, 252, 255)), (0.45, (178, 186, 196)), (0.55, (120, 128, 138)), (1, (205, 212, 222))],
                     anchor="lm", shadow=((sc(2), sc(3)), (0, 0, 0, 210)))
 
 # ------------------------------------------------------------------ C2 background (cyan grid)
