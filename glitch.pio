@@ -1,54 +1,65 @@
-; Copyright (c) 2022 Balázs Triszka <balika011@gmail.com>
+; Matrix Pico glitch program (RGH 1.2)
+;
+; Derived from PicoRGH by Balázs Triszka <balika011@gmail.com> (GPLv2).
+; Timing sequence unchanged; reset-line drive changed for safety.
 ;
 ; This program is free software; you can redistribute it and/or modify it
 ; under the terms and conditions of the GNU General Public License,
 ; version 2, as published by the Free Software Foundation.
 ;
-; This program is distributed in the hope it will be useful, but WITHOUT
-; ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
-; FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
-; more details.
+; SET pins (base = CPU_RESET, count = 2):
+;   bit 0 = CPU_RESET  (output latch held at 0; we switch its DIRECTION)
+;   bit 1 = PLL_BYPASS (normal push-pull output)
 ;
-; You should have received a copy of the GNU General Public License
-; along with this program.  If not, see <http://www.gnu.org/licenses/>.
+; Safety: the CPU reset line is a 1.1V net. The original program held it
+; driven HIGH at 3.3V for the whole glitch window (most of a second per
+; attempt). Here it is left floating (input / hi-Z) at all times except:
+;   - the glitch pulse itself, where it is pulled LOW, and
+;   - exactly ONE cycle of drive-high afterwards (RGH needs the line pulled
+;     up immediately rather than drifting), then back to floating.
+; At 192 MHz that one cycle is ~5 ns, mirroring what the Matrix CPLD does.
 ;
-; Unmodified from the original PicoRGH (X360Tools / balika011). The glitch
-; timing is driven entirely by the five values pushed from the C code, so
-; Matrix Pico tunes behaviour without touching this program.
+; POST is read on GPIO 28 (hard-coded below; keep in sync with main.c).
 
 .program glitch
-.side_set 2
 
-	pull                        side 0x1
-	mov x, osr                  side 0x1
-	pull                        side 0x1
-	mov y, osr                  side 0x1
+	pull block                  ; x = post_count
+	mov x, osr
+	pull block                  ; y = delay_to_pll
+	mov y, osr
 
 wait_for_post_loop:
-	wait 1 GPIO 28              side 0x1
-	wait 0 GPIO 28              side 0x1
-	jmp x-- wait_for_post_loop  side 0x1
+	wait 1 gpio 28
+	wait 0 gpio 28
+	jmp x-- wait_for_post_loop
 
 delay_pll:
-	jmp y-- delay_pll           side 0x1
+	jmp y-- delay_pll
 
-	pull                        side 0x3
-	mov x, osr                  side 0x3
-	pull                        side 0x3
-	mov y, osr                  side 0x3
+	set pins, 0b10              ; PLL bypass HIGH, reset still floating
 
-	wait 1 GPIO 28              side 0x3
+	pull block                  ; x = delay_to_rst
+	mov x, osr
+	pull block                  ; y = glitch_width (C side passes width-1)
+	mov y, osr
 
-delay_rst: ;
-	jmp x-- delay_rst           side 0x3
+	wait 1 gpio 28
 
+delay_rst:
+	jmp x-- delay_rst
+
+	set pindirs, 0b11           ; reset becomes output -> pulled LOW (glitch)
 hold_rst:
-	jmp y-- hold_rst            side 0x2
+	jmp y-- hold_rst
 
-	pull                        side 0x3
-	mov x, osr                  side 0x3
+	set pins, 0b11              ; reset driven HIGH for one cycle only
+	set pindirs, 0b10           ; reset back to floating
+	set pins, 0b10              ; reset latch back to 0 (no effect while floating)
 
+	pull block                  ; x = pll_hold
+	mov x, osr
 hold_pll:
-	jmp x-- hold_pll            side 0x3
+	jmp x-- hold_pll
 
-	push                        side 0x1
+	set pins, 0b00              ; PLL bypass LOW
+	push block                  ; tell the C side we're done

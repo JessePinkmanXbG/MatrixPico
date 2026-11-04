@@ -63,13 +63,13 @@
 #define PLL_BYPASS  27
 #define POST_PIN    28
 
-#define MP_SYS_CLK_KHZ 200000
+#define MP_SYS_CLK_KHZ 192000   /* multiple of 12/48 MHz; 4 cycles per STBY_CLK */
 
 /* ---- Profiles ----------------------------------------------------------- */
 #define NUM_TIMINGS     5
 #define NUM_PROFILES    4
 #define PROFILE_NAME_LEN 16
-#define CONFIG_MAGIC    0x4D505833u   /* "MPX3" - bump if layout/clock changes */
+#define CONFIG_MAGIC    0x4D505834u   /* "MPX4" - bump if layout/clock changes */
 #define CONFIG_VERSION  1
 
 /* Timing value meanings (index -> role), same order they are fed to the PIO:
@@ -113,10 +113,11 @@ static const config_t DEFAULT_CONFIG = {
     .active  = 0,
     .reserved = 0,
     .profiles = {
-        { "trinity", { 3, 108786906, 7288000, 47, 50000 } },
-        { "corona",  { 3, 108786906, 7288000, 47, 50000 } },  /* UNVERIFIED - dial in */
-        { "jasper",  { 3, 108786906, 7288000, 47, 50000 } },  /* UNVERIFIED - dial in */
-        { "falcon",  { 3, 108786906, 7288000, 47, 50000 } },  /* UNVERIFIED - dial in */
+        /* 192 MHz values (200 MHz values x 0.96, same real-time timing) */
+        { "trinity", { 3, 104435430, 6996480, 45, 48000 } },
+        { "corona",  { 3, 104435430, 6996480, 45, 48000 } },  /* UNVERIFIED - dial in */
+        { "jasper",  { 3, 104435430, 6996480, 45, 48000 } },  /* UNVERIFIED - dial in */
+        { "falcon",  { 3, 104435430, 6996480, 45, 48000 } },  /* UNVERIFIED - dial in */
     },
 };
 
@@ -212,9 +213,10 @@ static void run_glitch_once(PIO pio, uint sm, uint offset)
         tight_loop_contents();
 
     pio_sm_config c = glitch_program_get_default_config(offset);
-    sm_config_set_sideset_pins(&c, CPU_RESET);
+    sm_config_set_set_pins(&c, CPU_RESET, 2);   /* bit0 = RESET, bit1 = PLL */
 
     pio_gpio_init(pio, CPU_RESET);
+    gpio_disable_pulls(CPU_RESET);
     gpio_set_slew_rate(CPU_RESET, GPIO_SLEW_RATE_FAST);
     gpio_set_drive_strength(CPU_RESET, GPIO_DRIVE_STRENGTH_12MA);
 
@@ -222,9 +224,12 @@ static void run_glitch_once(PIO pio, uint sm, uint offset)
     gpio_set_slew_rate(PLL_BYPASS, GPIO_SLEW_RATE_FAST);
     gpio_set_drive_strength(PLL_BYPASS, GPIO_DRIVE_STRENGTH_12MA);
 
-    pio_sm_set_pins_with_mask(pio, sm, (1u << CPU_RESET) | (0u << PLL_BYPASS),
+    /* Both latches low. PLL is an output; RESET starts as an INPUT (floating)
+     * so we never hold the 1.1V reset line at 3.3V. glitch.pio only switches
+     * RESET to output for the pulse plus one pull-up cycle. */
+    pio_sm_set_pins_with_mask(pio, sm, 0u,
                               (1u << CPU_RESET) | (1u << PLL_BYPASS));
-    pio_sm_set_pindirs_with_mask(pio, sm, (1u << CPU_RESET) | (1u << PLL_BYPASS),
+    pio_sm_set_pindirs_with_mask(pio, sm, (1u << PLL_BYPASS),
                                  (1u << CPU_RESET) | (1u << PLL_BYPASS));
 
     pio_sm_init(pio, sm, offset, &c);
@@ -242,7 +247,9 @@ static void run_glitch_once(PIO pio, uint sm, uint offset)
     pio_sm_put_blocking(pio, sm, t[0]);   /* post_count   */
     pio_sm_put_blocking(pio, sm, t[1]);   /* delay_to_pll */
     pio_sm_put_blocking(pio, sm, t[2]);   /* delay_to_rst */
-    pio_sm_put_blocking(pio, sm, t[3]);   /* glitch_width */
+    /* The new PIO holds reset low for (y + 2) cycles vs (y + 1) before, so
+     * pass width-1 to keep glitch_width meaning exactly what it used to. */
+    pio_sm_put_blocking(pio, sm, t[3] > 0 ? t[3] - 1 : 0);   /* glitch_width */
     pio_sm_put_blocking(pio, sm, t[4]);   /* pll_hold     */
 
     pio_sm_get_blocking(pio, sm);         /* wait for the glitch to complete */
@@ -509,9 +516,10 @@ static void console_task(void)
 
 int main(void)
 {
-    /* Overclock for glitch-pulse resolution (~5 ns/cycle at 200 MHz).
-     * 266 MHz gives finer steps but is unstable with USB on some (clone)
-     * RP2040-Zero boards; 200 MHz is the reliable sweet spot. */
+    /* Overclock for glitch-pulse resolution (~5.2 ns/cycle at 192 MHz).
+     * 266 MHz is unstable with USB on some (clone) RP2040-Zero boards. 192 MHz
+     * is a multiple of 12/48 MHz (recommended by the RGH1.3 Pico work) and
+     * lines up 1:1 with Octal450's 192 MHz EXT_CLK counts. */
     vreg_set_voltage(VREG_VOLTAGE_1_20);
     sleep_ms(5);
     set_sys_clock_khz(MP_SYS_CLK_KHZ, true);

@@ -23,7 +23,7 @@ runs headless inside the console with no PC attached.
 
 | Pico pin | Xbox 360 point        | Notes                                             |
 |----------|-----------------------|---------------------------------------------------|
-| GP26     | CPU_RESET             | the glitch pulse — keep this wire **short**       |
+| GP26     | CPU_RESET             | the glitch pulse — keep this wire **short**. The line is 1.1V, so the firmware leaves it floating except for the pulse plus one ~5 ns pull-up cycle |
 | GP27     | CPU_PLL_BYPASS        | **series resistor**: 5–10K on Slim, 22K on Phat   |
 | GP28     | POST                  | monitored bit (hard-coded as GPIO 28 in the PIO)  |
 | GP16     | onboard RGB LED       | RP2040-Zero WS2812: blue = glitching, green = booted |
