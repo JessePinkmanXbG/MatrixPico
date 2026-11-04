@@ -96,6 +96,22 @@ The flashable `MatrixPico.uf2` lands in `build/`. Hold BOOTSEL, plug the Pico
 in, copy the `.uf2` onto the `RPI-RP2` drive. CI also builds the `.uf2` on every
 push and attaches it as a workflow artifact (see `.github/workflows/build.yml`).
 
+## Board profiles & methods
+
+Select a profile with `use <name>`; each carries its own method and timings.
+
+| Profile | Method | Status |
+|---|---|---|
+| trinity | RGH 1.2 | proven (balika011's values) |
+| corona | RGH 1.2 | seeded — [tune it](docs/CORONA.md) |
+| falcon / jasper | RGH 1.2 | seeded — tune like Corona |
+| zephyr | EXT_CLK | experimental — [hardware-test build](docs/ZEPHYR_EXTCLK.md) |
+
+RGH 1.2 and EXT_CLK are separate PIO engines; the firmware loads the right one
+for the active profile. On every method the reset line is open-drain (pulled
+low then released, never driven to 3.3V), so the 1.1V reset net is protected
+without clamp diodes.
+
 ## Credits
 
 Matrix Pico stands entirely on earlier work:
@@ -109,8 +125,17 @@ Matrix Pico stands entirely on earlier work:
 - The wider Xbox 360 homebrew scene, whose shared timing knowledge made the
   per-board profiles possible.
 
-New in Matrix Pico: the USB serial tuning console, per-board profiles, flash
-persistence, and the two-core split that keeps the console responsive.
+For the EXT_CLK engine (zephyr profile):
+
+- **15432, GliGli, Octal450** — [EXT_CLK](https://github.com/Octal450/EXT_CLK),
+  the open-source VHDL the timing and sequence were decoded from.
+- **wurthless-elektroniks** — [RGH1.3 / EXT+3](https://github.com/wurthless-elektroniks/RGH1.3)
+  and its RP2040 reference (public domain), the basis for the open-drain
+  reset and the 1.1V signal-level handling.
+
+New in Matrix Pico: the USB serial tuning console, per-board profiles, the
+sweep auto-tuner, flash persistence, the open-drain reset safety change, and
+the two-core split that keeps the console responsive.
 
 ## License
 

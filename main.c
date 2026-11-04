@@ -37,6 +37,7 @@
 #include "hardware/flash.h"
 #include "hardware/sync.h"
 #include "glitch.pio.h"
+#include "extclk.pio.h"
 
 /* Status LED. The RP2040-Zero's onboard RGB is a WS2812 on GP16; a classic
  * Pico has a plain LED on GP25. Set USE_WS2812 to match your board. */
@@ -52,24 +53,33 @@
  * GP26 -> CPU_RESET      (glitch pulse)
  * GP27 -> CPU_PLL_BYPASS (series resistor: 5-10K on Slim, 22K on Phat)
  * GP28 -> POST           (bit monitored; referenced as GPIO 28 in glitch.pio)
+ * GP29 -> EXT_CLK only: arm-sense on a 3.3V reset point (reset OUT stays 1.1V)
  * GP16 -> onboard WS2812 (RP2040-Zero): blue = glitching, green = booted.
  *                          Classic Pico: set USE_WS2812 0 to use GP25.
  * 3V3 / GND -> switched 3.3V and ground
  *
- * POST is hard-coded to GPIO 28 inside glitch.pio. If you move it, change it
- * in BOTH places.
+ * For EXT_CLK (zephyr), GP27 goes to CPU_EXT_CLK_EN and GP26 is open-drain to
+ * the 1.1V reset net. See docs/ZEPHYR_EXTCLK.md.
+ *
+ * POST is hard-coded to GPIO 28 inside glitch.pio AND extclk.pio. If you move
+ * it, change it in all places.
  * ------------------------------------------------------------------------ */
-#define CPU_RESET   26
-#define PLL_BYPASS  27
+#define CPU_RESET   26   /* reset pulse OUT (both methods); also arm-sense for RGH 1.2 */
+#define PLL_BYPASS  27   /* RGH 1.2: CPU_PLL_BYPASS.  EXT_CLK: CPU_EXT_CLK_EN (same pin) */
 #define POST_PIN    28
+#define RESET_SENSE 29   /* EXT_CLK only: arm-sense on a 3.3V reset point (reset OUT is 1.1V) */
+
+/* Glitch method per profile. */
+#define METHOD_RGH12   0   /* Trinity/Corona/Falcon/Jasper - PLL bypass */
+#define METHOD_EXTCLK  1   /* Xenon/Zephyr - EXT_CLK_EN slowdown */
 
 #define MP_SYS_CLK_KHZ 192000   /* multiple of 12/48 MHz; 4 cycles per STBY_CLK */
 
 /* ---- Profiles ----------------------------------------------------------- */
 #define NUM_TIMINGS     5
-#define NUM_PROFILES    4
+#define NUM_PROFILES    5
 #define PROFILE_NAME_LEN 16
-#define CONFIG_MAGIC    0x4D505834u   /* "MPX4" - bump if layout/clock changes */
+#define CONFIG_MAGIC    0x4D505835u   /* "MPX5" - bump if layout/clock changes */
 #define CONFIG_VERSION  1
 
 /* Timing value meanings (index -> role), same order they are fed to the PIO:
@@ -87,8 +97,23 @@ static const char *TIMING_NAMES[NUM_TIMINGS] = {
     "pll_hold",
 };
 
+/* EXT_CLK reuses the 5 slots with different meanings. */
+static const char *TIMING_NAMES_EXTCLK[NUM_TIMINGS] = {
+    "post_count",
+    "slow_delay",
+    "r_end",
+    "pulse_width",
+    "extc_hold",
+};
+
+static inline const char *tname(uint32_t method, int i)
+{
+    return (method == METHOD_EXTCLK) ? TIMING_NAMES_EXTCLK[i] : TIMING_NAMES[i];
+}
+
 typedef struct {
     char     name[PROFILE_NAME_LEN];
+    uint32_t method;                  /* METHOD_RGH12 or METHOD_EXTCLK */
     uint32_t t[NUM_TIMINGS];
 } profile_t;
 
@@ -113,11 +138,16 @@ static const config_t DEFAULT_CONFIG = {
     .active  = 0,
     .reserved = 0,
     .profiles = {
-        /* 192 MHz values (200 MHz values x 0.96, same real-time timing) */
-        { "trinity", { 3, 104435430, 6996480, 45, 48000 } },
-        { "corona",  { 3, 104435430, 6996480, 45, 48000 } },  /* UNVERIFIED - dial in */
-        { "jasper",  { 3, 104435430, 6996480, 45, 48000 } },  /* UNVERIFIED - dial in */
-        { "falcon",  { 3, 104435430, 6996480, 45, 48000 } },  /* UNVERIFIED - dial in */
+        /* RGH 1.2, 192 MHz values (200 MHz x 0.96, same real-time timing).
+         * trinity carries balika011's proven numbers; others are seeds. */
+        { "trinity", METHOD_RGH12,  { 3, 104435430, 6996480, 45, 48000 } },
+        { "corona",  METHOD_RGH12,  { 3, 104435430, 6996480, 45, 48000 } },  /* dial in */
+        { "jasper",  METHOD_RGH12,  { 3, 104435430, 6996480, 45, 48000 } },  /* dial in */
+        { "falcon",  METHOD_RGH12,  { 3, 104435430, 6996480, 45, 48000 } },  /* dial in */
+        /* EXT_CLK seeds from Octal450's Zephyr VHDL @192MHz: r_end 118008,
+         * pulse 2, slow_delay ~382ms (73,344,000 cyc), T_BUF 50000, ~12 pulses.
+         * These are STRUCTURAL SEEDS - must be dialed in on hardware. */
+        { "zephyr",  METHOD_EXTCLK, { 12, 73344000, 118008, 2, 50000 } },     /* dial in */
     },
 };
 
@@ -198,22 +228,26 @@ static inline void led_green(void) { gpio_put(LED_PIN, 1); }
 
 /* ---- Glitch core (core1) ------------------------------------------------ */
 
-static void run_glitch_once(PIO pio, uint sm, uint offset)
+static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
 {
     if (sweep_active)
         g_cfg.profiles[g_cfg.active].t[sweep_idx] = sweep_val;
 
     const uint32_t *t = g_cfg.profiles[g_cfg.active].t;
 
-    gpio_init(CPU_RESET);
-    gpio_set_dir(CPU_RESET, GPIO_IN);
-    gpio_set_slew_rate(CPU_RESET, GPIO_SLEW_RATE_FAST);
-    gpio_set_drive_strength(CPU_RESET, GPIO_DRIVE_STRENGTH_12MA);
-    while (!gpio_get(CPU_RESET))
+    /* RGH 1.2 senses the reset line it also pulses (GP26). EXT_CLK can't read
+     * the 1.1V reset net, so it arms off a separate 3.3V reset point (GP29). */
+    uint arm_pin = (method == METHOD_EXTCLK) ? RESET_SENSE : CPU_RESET;
+
+    gpio_init(arm_pin);
+    gpio_set_dir(arm_pin, GPIO_IN);
+    while (!gpio_get(arm_pin))
         tight_loop_contents();
 
-    pio_sm_config c = glitch_program_get_default_config(offset);
-    sm_config_set_set_pins(&c, CPU_RESET, 2);   /* bit0 = RESET, bit1 = PLL */
+    pio_sm_config c = (method == METHOD_EXTCLK)
+        ? extclk_program_get_default_config(offset)
+        : glitch_program_get_default_config(offset);
+    sm_config_set_set_pins(&c, CPU_RESET, 2);   /* bit0 = RESET, bit1 = PLL/EXTC */
 
     pio_gpio_init(pio, CPU_RESET);
     gpio_disable_pulls(CPU_RESET);
@@ -244,13 +278,13 @@ static void run_glitch_once(PIO pio, uint sm, uint offset)
         sleep_ms(17);
     }
 
-    pio_sm_put_blocking(pio, sm, t[0]);   /* post_count   */
-    pio_sm_put_blocking(pio, sm, t[1]);   /* delay_to_pll */
-    pio_sm_put_blocking(pio, sm, t[2]);   /* delay_to_rst */
-    /* The new PIO holds reset low for (y + 2) cycles vs (y + 1) before, so
-     * pass width-1 to keep glitch_width meaning exactly what it used to. */
-    pio_sm_put_blocking(pio, sm, t[3] > 0 ? t[3] - 1 : 0);   /* glitch_width */
-    pio_sm_put_blocking(pio, sm, t[4]);   /* pll_hold     */
+    /* Same 5-value feed for both engines (slots mean different things per
+     * method). Reset-low lasts (y + 1) cycles, so pass width-1. */
+    pio_sm_put_blocking(pio, sm, t[0]);                      /* post_count */
+    pio_sm_put_blocking(pio, sm, t[1]);                      /* delay_to_pll / slow_delay */
+    pio_sm_put_blocking(pio, sm, t[2]);                      /* delay_to_rst / r_end */
+    pio_sm_put_blocking(pio, sm, t[3] > 0 ? t[3] - 1 : 0);   /* glitch_width / pulse_width */
+    pio_sm_put_blocking(pio, sm, t[4]);                      /* pll_hold / extc_hold */
 
     pio_sm_get_blocking(pio, sm);         /* wait for the glitch to complete */
 
@@ -259,16 +293,16 @@ static void run_glitch_once(PIO pio, uint sm, uint offset)
 
     led_off();
 
-    gpio_init(CPU_RESET);
-    gpio_set_dir(CPU_RESET, GPIO_IN);
+    gpio_init(arm_pin);
+    gpio_set_dir(arm_pin, GPIO_IN);
 
-    /* If CPU_RESET stays high, the console booted: flash green briefly, then
-     * go dark so the LED isn't lit while the console runs. If it drops quickly,
-     * the glitch missed and we loop round for another attempt. */
+    /* If the reset-sense line stays high, the console booted: flash green
+     * briefly, then go dark. If it drops quickly, the glitch missed and we
+     * loop round for another attempt. */
     absolute_time_t t0 = get_absolute_time();
     bool shown = false;
     bool booted = false;
-    while (gpio_get(CPU_RESET)) {
+    while (gpio_get(arm_pin)) {
         if (!shown && absolute_time_diff_us(t0, get_absolute_time()) > 1500000) {
             booted = true;
             /* boot confirmed: flash blue 2.5s, then solid green 5s, then off */
@@ -316,10 +350,26 @@ static void core1_main(void)
 
     PIO pio = pio0;
     uint sm = 0;
-    uint offset = pio_add_program(pio, &glitch_program);
+    int loaded = -1;
+    uint offset = 0;
 
-    while (true)
-        run_glitch_once(pio, sm, offset);
+    while (true) {
+        /* (Re)load the engine for the active profile's method. Both programs
+         * don't fit in one PIO at once, so we swap when the method changes. */
+        uint m = g_cfg.profiles[g_cfg.active].method;
+        if ((int)m != loaded) {
+            if (loaded >= 0) {
+                pio_sm_set_enabled(pio, sm, false);
+                pio_remove_program(pio,
+                    (loaded == METHOD_EXTCLK) ? &extclk_program : &glitch_program,
+                    offset);
+            }
+            offset = pio_add_program(pio,
+                (m == METHOD_EXTCLK) ? &extclk_program : &glitch_program);
+            loaded = (int)m;
+        }
+        run_glitch_once(pio, sm, offset, m);
+    }
 }
 
 /* ---- Serial console (core0) --------------------------------------------- */
@@ -334,10 +384,12 @@ static void print_banner(void)
 
 static void print_profile(int i)
 {
-    printf("[%d] %-8s%s\n", i, g_cfg.profiles[i].name,
+    uint32_t m = g_cfg.profiles[i].method;
+    printf("[%d] %-8s (%s)%s\n", i, g_cfg.profiles[i].name,
+           (m == METHOD_EXTCLK) ? "EXT_CLK" : "RGH1.2",
            (i == (int)g_cfg.active) ? "  <= active" : "");
     for (int k = 0; k < NUM_TIMINGS; k++)
-        printf("      %d %-12s = %lu\n", k, TIMING_NAMES[k],
+        printf("      %d %-12s = %lu\n", k, tname(m, k),
                (unsigned long)g_cfg.profiles[i].t[k]);
 }
 
@@ -421,7 +473,7 @@ static void handle_line(char *line)
         uint32_t v = (uint32_t)strtoul(b, NULL, 0);
         g_cfg.profiles[g_cfg.active].t[idx] = v;
         printf("%s.%s = %lu (unsaved)\n", g_cfg.profiles[g_cfg.active].name,
-               TIMING_NAMES[idx], (unsigned long)v);
+               tname(g_cfg.profiles[g_cfg.active].method, idx), (unsigned long)v);
     } else if (!strcmp(cmd, "name")) {
         char *a = strtok(NULL, " \t");
         if (!a) { printf("err: name <newname>\n"); return; }
@@ -479,13 +531,13 @@ static void handle_line(char *line)
         sweep_tick = 0;
         sweep_landed = false;
         sweep_active = true;
-        printf("sweeping %s from %lu to %lu step %ld\n", TIMING_NAMES[idx],
+        printf("sweeping %s from %lu to %lu step %ld\n", tname(g_cfg.profiles[g_cfg.active].method, idx),
                (unsigned long)s, (unsigned long)e, (long)st);
         printf("power-cycle the console; it steps each miss until it boots.\n");
     } else if (!strcmp(cmd, "sweepstop")) {
         sweep_active = false;
         printf("sweep stopped at %s=%lu ('save' to keep).\n",
-               TIMING_NAMES[sweep_idx], (unsigned long)sweep_val);
+               tname(g_cfg.profiles[g_cfg.active].method, sweep_idx), (unsigned long)sweep_val);
     } else {
         printf("err: unknown command '%s' (try 'help')\n", cmd);
     }
@@ -546,13 +598,13 @@ int main(void)
         console_task();
         if (sweep_active && sweep_tick != last_tick) {
             last_tick = sweep_tick;
-            printf("  sweep: %s = %lu\n", TIMING_NAMES[sweep_idx],
+            printf("  sweep: %s = %lu\n", tname(g_cfg.profiles[g_cfg.active].method, sweep_idx),
                    (unsigned long)sweep_val);
         }
         if (sweep_landed) {
             sweep_landed = false;
             printf("\n*** GLITCH LANDED: %s = %lu ***  ('save' to keep)\n> ",
-                   TIMING_NAMES[sweep_idx], (unsigned long)sweep_landed_val);
+                   tname(g_cfg.profiles[g_cfg.active].method, sweep_idx), (unsigned long)sweep_landed_val);
         }
         sleep_ms(2);
     }
