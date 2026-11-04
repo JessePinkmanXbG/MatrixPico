@@ -63,13 +63,13 @@
 #define PLL_BYPASS  27
 #define POST_PIN    28
 
-#define MP_SYS_CLK_KHZ 266000
+#define MP_SYS_CLK_KHZ 200000
 
 /* ---- Profiles ----------------------------------------------------------- */
 #define NUM_TIMINGS     5
 #define NUM_PROFILES    4
 #define PROFILE_NAME_LEN 16
-#define CONFIG_MAGIC    0x4D505832u   /* "MPX2" - bump if layout changes */
+#define CONFIG_MAGIC    0x4D505833u   /* "MPX3" - bump if layout/clock changes */
 #define CONFIG_VERSION  1
 
 /* Timing value meanings (index -> role), same order they are fed to the PIO:
@@ -113,10 +113,10 @@ static const config_t DEFAULT_CONFIG = {
     .active  = 0,
     .reserved = 0,
     .profiles = {
-        { "trinity", { 3, 144686585, 9693040, 63, 66500 } },
-        { "corona",  { 3, 144686585, 9693040, 63, 66500 } },  /* UNVERIFIED - dial in */
-        { "jasper",  { 3, 144686585, 9693040, 63, 66500 } },  /* UNVERIFIED - dial in */
-        { "falcon",  { 3, 144686585, 9693040, 63, 66500 } },  /* UNVERIFIED - dial in */
+        { "trinity", { 3, 108786906, 7288000, 47, 50000 } },
+        { "corona",  { 3, 108786906, 7288000, 47, 50000 } },  /* UNVERIFIED - dial in */
+        { "jasper",  { 3, 108786906, 7288000, 47, 50000 } },  /* UNVERIFIED - dial in */
+        { "falcon",  { 3, 108786906, 7288000, 47, 50000 } },  /* UNVERIFIED - dial in */
     },
 };
 
@@ -412,8 +412,11 @@ static void console_task(void)
 
 int main(void)
 {
-    /* Overclock for glitch-pulse resolution (~3.75 ns/cycle at 266 MHz). */
-    vreg_set_voltage(VREG_VOLTAGE_1_30);
+    /* Overclock for glitch-pulse resolution (~5 ns/cycle at 200 MHz).
+     * 266 MHz gives finer steps but is unstable with USB on some (clone)
+     * RP2040-Zero boards; 200 MHz is the reliable sweet spot. */
+    vreg_set_voltage(VREG_VOLTAGE_1_20);
+    sleep_ms(5);
     set_sys_clock_khz(MP_SYS_CLK_KHZ, true);
 
     uint32_t freq = clock_get_hz(clk_sys);
