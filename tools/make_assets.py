@@ -111,8 +111,6 @@ def chip_rp2040(img, cx, cy):
     ImageDraw.Draw(um).rounded_rectangle([0, 0, ug.size[0] - 1, ug.size[1] - 1], radius=sc(4), fill=255)
     img.paste(ug.convert("RGBA"), (sc(ux0), sc(cy - 11)), um)
     d.rounded_rectangle([sc(ux0), sc(cy - 11), sc(ux1), sc(cy + 11)], radius=sc(4), outline=(90, 96, 106), width=sc(1))
-    d.rounded_rectangle([sc(ux0 + 3), sc(cy - 4), sc(ux1 - 4), sc(cy + 4)], radius=sc(3), fill=(30, 34, 40))
-    d.rectangle([sc(ux0 + 5), sc(cy - 1), sc(ux1 - 6), sc(cy + 1)], fill=(150, 156, 166))
     # BOOT / RESET buttons
     for by in (cy - 18, cy + 18):
         d.rounded_rectangle([sc(L + 18), sc(by - 3), sc(L + 26), sc(by + 3)], radius=sc(1), fill=(200, 204, 210), outline=(80, 84, 92))
@@ -128,10 +126,8 @@ def chip_rp2040(img, cx, cy):
     d.rounded_rectangle([sc(qx - qs / 2), sc(qy - qs / 2), sc(qx + qs / 2), sc(qy + qs / 2)], radius=sc(2), fill=(16, 16, 20), outline=(88, 92, 100), width=sc(1))
     d.ellipse([sc(qx - qs / 2 + 3), sc(qy - qs / 2 + 3), sc(qx - qs / 2 + 6), sc(qy - qs / 2 + 6)], fill=(210, 214, 220))
     d.text((sc(qx + 1), sc(qy + 2)), "RP2040", font=F(MONOB, 3.6), fill=(150, 156, 166), anchor="mm")
-    # flash chip + WS2812 LED
+    # flash chip
     d.rounded_rectangle([sc(R - 16), sc(cy - 20), sc(R - 6), sc(cy - 13)], radius=sc(1), fill=(20, 20, 24), outline=(80, 84, 92))
-    d.rounded_rectangle([sc(R - 12), sc(cy + 12), sc(R - 5), sc(cy + 19)], radius=sc(1), fill=(236, 238, 240), outline=(120, 124, 130))
-    d.ellipse([sc(R - 9.5), sc(cy + 14.5), sc(R - 7.5), sc(cy + 16.5)], fill=(60, 255, 120))
 
 def logo(img):
     chip_w = 88
