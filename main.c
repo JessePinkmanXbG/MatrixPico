@@ -76,6 +76,15 @@
 #ifndef MP_SYS_CLK_KHZ
 #define MP_SYS_CLK_KHZ 192000   /* multiple of 12/48 MHz; 4 cycles per STBY_CLK */
 #endif
+#ifdef MP_T_SIDE
+#define MP_DRV_PROG        glitch_side_program
+#define MP_DRV_CFG(o)      glitch_side_program_get_default_config(o)
+#define MP_DRV_WIDTH(w)    (w)
+#else
+#define MP_DRV_PROG        glitch_drv_program
+#define MP_DRV_CFG(o)      glitch_drv_program_get_default_config(o)
+#define MP_DRV_WIDTH(w)    ((w) > 0 ? (w) - 1 : 0)
+#endif
 #ifndef MP_RST_DRIVEN
 #define MP_RST_DRIVEN 0          /* TEST BUILDS ONLY: 1 = original PicoRGH push-pull reset drive */
 #endif
@@ -314,7 +323,7 @@ static void led_green_hold(void)               /* confirmed boot: solid green 5s
 static const pio_program_t *eng_prog(int e)
 {
     return (e == 1) ? &extclk_program : (e == 2) ? &glitch_pu_program
-         : (e == 3) ? &glitch_drv_program : &glitch_program;
+         : (e == 3) ? &MP_DRV_PROG : &glitch_program;
 }
 
 static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pullup, bool driven)
@@ -335,10 +344,13 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
 
     pio_sm_config c = (method == METHOD_EXTCLK)
         ? extclk_program_get_default_config(offset)
-        : (driven ? glitch_drv_program_get_default_config(offset)
+        : (driven ? MP_DRV_CFG(offset)
           : pullup ? glitch_pu_program_get_default_config(offset)
                    : glitch_program_get_default_config(offset));
     sm_config_set_set_pins(&c, CPU_RESET, 2);   /* bit0 = RESET, bit1 = PLL/EXTC */
+#ifdef MP_T_SIDE
+    if (driven) sm_config_set_sideset_pins(&c, CPU_RESET);
+#endif
 
     pio_gpio_init(pio, CPU_RESET);
     gpio_disable_pulls(CPU_RESET);
@@ -379,7 +391,7 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
     pio_sm_put_blocking(pio, sm, t[0]);                      /* post_count */
     pio_sm_put_blocking(pio, sm, t[1]);                      /* delay_to_pll / slow_delay */
     pio_sm_put_blocking(pio, sm, t[2]);                      /* delay_to_rst / r_end */
-    pio_sm_put_blocking(pio, sm, t[3] > 0 ? t[3] - 1 : 0);   /* glitch_width / pulse_width */
+    pio_sm_put_blocking(pio, sm, driven ? MP_DRV_WIDTH(t[3]) : (t[3] > 0 ? t[3] - 1 : 0));   /* glitch_width / pulse_width */
     pio_sm_put_blocking(pio, sm, t[4]);                      /* pll_hold / extc_hold */
 
     while (pio_sm_is_rx_fifo_empty(pio, sm))
@@ -451,9 +463,11 @@ static void core1_main(void)
      * LOW state from the very start, so it is never left floating at the console
      * during the window before the first arm. The reset pin stays an input
      * (floating) - it must never source voltage into the 1.1V net. */
+#ifndef MP_T_NOPLL
     gpio_init(PLL_BYPASS);
     gpio_put(PLL_BYPASS, 0);
     gpio_set_dir(PLL_BYPASS, GPIO_OUT);
+#endif
     gpio_init(CPU_RESET);
     gpio_set_dir(CPU_RESET, GPIO_IN);
 
