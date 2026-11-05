@@ -227,7 +227,8 @@ def flash_pico(console, log=lambda s: None, status=lambda s: None,
     if not port:
         raise FlashError("flashed, but the Pico did not show up as a serial port")
 
-    status(f"setting up {console}...")
-    configure_console(port, console, log)
+    # No profile write here: each board's firmware already boots with its own
+    # profile active, and writing the flash config sector changed nothing but
+    # risk. The flashed Pico is byte-identical to a drag-and-drop flash.
     status(f"Pico successfully flashed ({console})")
     return port
