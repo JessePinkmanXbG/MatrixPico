@@ -261,6 +261,7 @@ static inline void led_red(void)   { gpio_put(LED_PIN, 1); }
  * Fast blue flicker for 2.5s from the moment we arm; solid green for 5s on a
  * confirmed boot; red for 1s on a failed attempt. Everything is non-blocking
  * (except the green hold) so a red/blue phase never delays arming the next try. */
+#define GREEN_GAP_MS 500   /* dark gap between the blue flicker and the green */
 static int g_led_cur = -1;                       /* 0 off, 1 blue, 2 red, 3 green */
 static absolute_time_t g_flick_t0, g_flick_end, g_red_end;   /* zero-init = nil_time */
 
@@ -411,9 +412,10 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
         if (p != lastp) { edges++; lastp = p; hh->etot = edges; }
         led_tick();
         /* Green as soon as the POST edges prove a boot - but never before the 2.5s
-         * blue flicker has finished, so the sequence always reads blue -> green. */
+         * blue flicker has finished plus a short dark gap (GREEN_GAP_MS), so the
+         * sequence always reads blue -> pause -> green. */
         if (!judged && edges >= g_boot_edges &&
-            absolute_time_diff_us(get_absolute_time(), g_flick_end) <= 0) {
+            absolute_time_diff_us(get_absolute_time(), delayed_by_ms(g_flick_end, GREEN_GAP_MS)) <= 0) {
             judged = true;
             g_last_edges = edges;
             hh->e15 = edges;
