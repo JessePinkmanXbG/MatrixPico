@@ -263,7 +263,8 @@ static inline void led_red(void)   { gpio_put(LED_PIN, 1); }
  * (except the green hold) so a red/blue phase never delays arming the next try. */
 #define GREEN_GAP_MS 500   /* dark gap between the blue flicker and the green */
 static int g_led_cur = -1;                       /* 0 off, 1 blue, 2 red, 3 green */
-static absolute_time_t g_flick_t0, g_flick_end, g_red_end;   /* zero-init = nil_time */
+static absolute_time_t g_flick_t0, g_flick_end, g_red_end, g_green_t0;
+static bool g_green_on = false;     /* boot confirmed: 2s blink then 10s solid, timer-driven */   /* zero-init = nil_time */
 
 static void led_set(int c)
 {
@@ -280,6 +281,13 @@ static void led_set(int c)
 static void led_tick(void)
 {
     absolute_time_t n = get_absolute_time();
+    if (g_green_on) {                       /* never blocks: the glitch loop keeps watching reset */
+        int64_t el = absolute_time_diff_us(g_green_t0, n) / 1000;   /* ms */
+        if (el < 2000)       led_set(((el / 100) & 1) == 0 ? 3 : 0);   /* 2s blinking */
+        else if (el < 12000) led_set(3);                              /* 10s solid */
+        else { g_green_on = false; led_set(0); }
+        return;
+    }
     if (absolute_time_diff_us(n, g_red_end) > 0) { led_set(2); return; }
     if (absolute_time_diff_us(n, g_flick_end) > 0) {
         int64_t el = absolute_time_diff_us(g_flick_t0, n);
@@ -291,6 +299,7 @@ static void led_tick(void)
 
 static void led_flicker_start(void)
 {
+    g_green_on = false;
     g_flick_t0 = get_absolute_time();
     g_flick_end = delayed_by_ms(g_flick_t0, 2500);
 }
@@ -301,13 +310,13 @@ static void led_red_for(uint ms)
     led_tick();
 }
 
-static void led_green_hold(void)               /* confirmed boot: solid green 5s */
+static void led_green_hold(void)               /* confirmed boot: green blinks 2s, solid 10s (non-blocking) */
 {
     g_red_end = nil_time;
     g_flick_end = nil_time;
-    led_set(3);
-    sleep_ms(5000);
-    led_set(0);
+    g_green_t0 = get_absolute_time();
+    g_green_on = true;
+    led_tick();
 }
 
 
@@ -438,6 +447,12 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
     hh->ms = (uint32_t)(absolute_time_diff_us(t0, get_absolute_time()) / 1000);
     hh->done = 1;
     if (!judged) { g_last_edges = edges; hh->e15 = edges; }   /* reset dropped before 4s: a miss */
+    if (g_green_on) {                      /* reset dropped while 'green': it was not a real boot */
+        g_green_on = false;
+        led_set(0);
+        led_red_for(1000);
+        red_done = true;
+    }
     if (!booted && !red_done) led_red_for(1000);
 
     if (sweep_active) {
