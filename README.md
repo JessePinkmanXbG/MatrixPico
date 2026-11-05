@@ -154,3 +154,9 @@ the two-core split that keeps the console responsive.
 
 GPL-2.0, inherited from PicoRGH. See [LICENSE](LICENSE). If you build on this,
 keep it open and keep the credits.
+
+### Firmware shipped inside the tool
+
+The tool bundles `firmware/MatrixPico.uf2` - the exact binary that was tested on
+a console - rather than recompiling it in CI. When the firmware changes, rebuild
+it, test it on hardware, and replace that file.

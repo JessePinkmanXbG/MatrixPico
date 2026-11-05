@@ -14,39 +14,7 @@ permissions:
   contents: write
 
 jobs:
-  firmware:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install ARM toolchain
-        uses: carlosperate/arm-none-eabi-gcc-action@v1
-        with:
-          release: '13.2.Rel1'
-
-      - name: Checkout Pico SDK
-        uses: actions/checkout@v4
-        with:
-          repository: raspberrypi/pico-sdk
-          ref: 2.1.0
-          path: pico-sdk
-          submodules: true
-
-      - name: Build firmware
-        run: |
-          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --parallel
-        env:
-          PICO_SDK_PATH: ${{ github.workspace }}/pico-sdk
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: firmware-uf2
-          path: build/MatrixPico.uf2
-          if-no-files-found: error
-
   build:
-    needs: firmware
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -55,11 +23,14 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Get firmware to bundle
-        uses: actions/download-artifact@v4
-        with:
-          name: firmware-uf2
-          path: tools/assets
+      # Bundle the exact firmware binary that was hardware-tested (firmware/MatrixPico.uf2),
+      # NOT a fresh CI compile: a different toolchain produced different code and
+      # different boot behaviour on the console.
+      - name: Use the hardware-validated firmware
+        shell: bash
+        run: |
+          cp firmware/MatrixPico.uf2 tools/assets/MatrixPico.uf2
+          ls -l tools/assets/MatrixPico.uf2
 
       - name: Install deps
         run: pip install pyserial pillow pyinstaller
