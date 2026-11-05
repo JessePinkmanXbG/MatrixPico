@@ -234,14 +234,69 @@ static void led_init(void) {
 static inline void led_off(void)   { led_raw(0); }
 static inline void led_blue(void)  { led_raw(led_rgb(0, 0, 24)); }
 static inline void led_green(void) { led_raw(led_rgb(0, 24, 0)); }
+static inline void led_red(void)   { led_raw(led_rgb(24, 0, 0)); }
 #else
 static void led_init(void) { gpio_init(LED_PIN); gpio_set_dir(LED_PIN, GPIO_OUT); }
 static inline void led_off(void)   { gpio_put(LED_PIN, 0); }
 static inline void led_blue(void)  { gpio_put(LED_PIN, 1); }
 static inline void led_green(void) { gpio_put(LED_PIN, 1); }
+static inline void led_red(void)   { gpio_put(LED_PIN, 1); }
 #endif
 
 /* ---- Glitch core (core1) ------------------------------------------------ */
+
+/* ---- LED state machine (core1) ------------------------------------------
+ * Fast blue flicker for 2.5s from the moment we arm; solid green for 5s on a
+ * confirmed boot; red for 1s on a failed attempt. Everything is non-blocking
+ * (except the green hold) so a red/blue phase never delays arming the next try. */
+static int g_led_cur = -1;                       /* 0 off, 1 blue, 2 red, 3 green */
+static absolute_time_t g_flick_t0, g_flick_end, g_red_end;   /* zero-init = nil_time */
+
+static void led_set(int c)
+{
+    if (c == g_led_cur) return;
+    g_led_cur = c;
+    switch (c) {
+    case 1:  led_blue();  break;
+    case 2:  led_red();   break;
+    case 3:  led_green(); break;
+    default: led_off();   break;
+    }
+}
+
+static void led_tick(void)
+{
+    absolute_time_t n = get_absolute_time();
+    if (absolute_time_diff_us(n, g_red_end) > 0) { led_set(2); return; }
+    if (absolute_time_diff_us(n, g_flick_end) > 0) {
+        int64_t el = absolute_time_diff_us(g_flick_t0, n);
+        led_set(((el / 17000) & 1) == 0 ? 1 : 0);
+        return;
+    }
+    led_set(0);
+}
+
+static void led_flicker_start(void)
+{
+    g_flick_t0 = get_absolute_time();
+    g_flick_end = delayed_by_ms(g_flick_t0, 2500);
+}
+
+static void led_red_for(uint ms)
+{
+    g_red_end = make_timeout_time_ms(ms);
+    led_tick();
+}
+
+static void led_green_hold(void)               /* confirmed boot: solid green 5s */
+{
+    g_red_end = nil_time;
+    g_flick_end = nil_time;
+    led_set(3);
+    sleep_ms(5000);
+    led_set(0);
+}
+
 
 static const pio_program_t *eng_prog(int e)
 {
@@ -262,7 +317,7 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
     gpio_init(arm_pin);
     gpio_set_dir(arm_pin, GPIO_IN);
     while (!gpio_get(arm_pin))
-        tight_loop_contents();
+        led_tick();                       /* lets a red phase time out while we wait */
 
     pio_sm_config c = (method == METHOD_EXTCLK)
         ? extclk_program_get_default_config(offset)
@@ -290,14 +345,7 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
     pio_sm_init(pio, sm, offset, &c);
     pio_sm_set_enabled(pio, sm, true);
 
-    /* Fast blue flashing during the arm window (before the glitch pulse), so
-     * repeated attempts show as a rapid blue flicker. ~200ms total. */
-    for (int i = 0; i < 6; i++) {
-        led_blue();
-        sleep_ms(17);
-        led_off();
-        sleep_ms(17);
-    }
+    led_flicker_start();      /* 2.5s fast blue flicker, non-blocking */
 
     /* Same 5-value feed for both engines (slots mean different things per
      * method). Reset-low lasts (y + 1) cycles, so pass width-1. */
@@ -307,12 +355,12 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
     pio_sm_put_blocking(pio, sm, t[3] > 0 ? t[3] - 1 : 0);   /* glitch_width / pulse_width */
     pio_sm_put_blocking(pio, sm, t[4]);                      /* pll_hold / extc_hold */
 
-    pio_sm_get_blocking(pio, sm);         /* wait for the glitch to complete */
+    while (pio_sm_is_rx_fifo_empty(pio, sm))
+        led_tick();
+    pio_sm_get_blocking(pio, sm);         /* glitch complete */
 
     pio_sm_set_enabled(pio, sm, false);
     pio_sm_restart(pio, sm);
-
-    led_off();
 
     gpio_init(arm_pin);
     gpio_set_dir(arm_pin, GPIO_IN);
@@ -324,33 +372,27 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
     absolute_time_t t0 = get_absolute_time();
     bool judged = false;
     bool booted = false;
+    bool red_done = false;
     uint32_t edges = 0;
     bool lastp = gpio_get(POST_PIN);
     while (gpio_get(arm_pin)) {
         bool p = gpio_get(POST_PIN);
         if (p != lastp) { edges++; lastp = p; }
+        led_tick();
         if (!judged && absolute_time_diff_us(t0, get_absolute_time()) > 1500000) {
             judged = true;
             g_last_edges = edges;
             if (edges >= g_boot_edges) {
                 booted = true;
-                /* boot confirmed: flash blue 2.5s, then solid green 5s, then off */
-                absolute_time_t s0 = get_absolute_time();
-                while (absolute_time_diff_us(s0, get_absolute_time()) < 2500000) {
-                    led_blue();
-                    sleep_ms(100);
-                    led_off();
-                    sleep_ms(100);
-                }
-                led_green();
-                sleep_ms(5000);
-                led_off();
+                led_green_hold();          /* boot confirmed: solid green 5s */
+            } else {
+                led_red_for(1000);         /* hung: red 1s, keep waiting for the reset */
+                red_done = true;
             }
         }
-        tight_loop_contents();
     }
     if (!judged) g_last_edges = edges;   /* reset dropped before 1.5s: a miss */
-    led_off();
+    if (!booted && !red_done) led_red_for(1000);
 
     if (sweep_active) {
         if (booted) {
