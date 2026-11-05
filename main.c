@@ -74,27 +74,14 @@
 #define METHOD_EXTCLK  1   /* Xenon/Zephyr - EXT_CLK_EN slowdown */
 
 #ifndef MP_SYS_CLK_KHZ
-#define MP_SYS_CLK_KHZ 192000   /* multiple of 12/48 MHz; 4 cycles per STBY_CLK */
-#endif
-#ifndef MP_T_SET
-#define MP_DRV_PROG        glitch_side_program
-#define MP_DRV_CFG(o)      glitch_side_program_get_default_config(o)
-#define MP_DRV_WIDTH(w)    (w)
-#else
-#define MP_DRV_PROG        glitch_drv_program
-#define MP_DRV_CFG(o)      glitch_drv_program_get_default_config(o)
-#define MP_DRV_WIDTH(w)    ((w) > 0 ? (w) - 1 : 0)
-#endif
-#ifndef MP_RST_DRIVEN
-#define MP_RST_DRIVEN 0          /* TEST BUILDS ONLY: 1 = original PicoRGH push-pull reset drive */
+#define MP_SYS_CLK_KHZ 200000   /* ~5 ns per PIO cycle; hardware-validated on Trinity */
 #endif
 
 /* ---- Profiles ----------------------------------------------------------- */
 #define NUM_TIMINGS     5
 #define NUM_PROFILES    6
 #define PROFILE_NAME_LEN 16
-/* Test variants get their own magic so they never load each other's saved timings. */
-#define CONFIG_MAGIC    (0x4D505836u ^ ((MP_SYS_CLK_KHZ == 200000) ? 0x100u : 0u) ^ 0x400u)  /* diag layout: runtime options in "reserved" */
+#define CONFIG_MAGIC    0x4D505837u   /* "MPX7" - bump if layout/clock/engine changes */
 #define CONFIG_MAGIC_V5 0x4D505835u   /* "MPX5" - 5-profile layout, migrated on load */
 #define NUM_PROFILES_V5 5
 #define CONFIG_VERSION  1
@@ -161,7 +148,7 @@ static const config_t DEFAULT_CONFIG = {
     .magic   = CONFIG_MAGIC,
     .version = CONFIG_VERSION,
     .active  = 0,
-    .reserved = 0x6,   /* DIAG default = A2-equivalent: bit1 driven reset, bit2 POST pull-down */
+    .reserved = 0,
     .profiles = {
         /* RGH 1.2, 192 MHz values (200 MHz x 0.96, same real-time timing).
          * trinity carries balika011's proven numbers; others are seeds. */
@@ -325,12 +312,15 @@ static void led_green_hold(void)               /* confirmed boot: solid green 5s
 
 static const pio_program_t *eng_prog(int e)
 {
-    return (e == 1) ? &extclk_program : (e == 2) ? &glitch_pu_program
-         : (e == 3) ? &MP_DRV_PROG : &glitch_program;
+    return (e == 1) ? &extclk_program : &glitch_program;
 }
 
-static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pullup, bool driven)
+static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
 {
+    /* RGH 1.2 uses the original PicoRGH program, which drives CPU_RESET (high
+     * between pulses, low for the glitch). EXT_CLK keeps its open-drain engine. */
+    const bool driven = (method != METHOD_EXTCLK);
+
     if (sweep_active)
         g_cfg.profiles[g_cfg.active].t[sweep_idx] = sweep_val;
 
@@ -347,13 +337,9 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
 
     pio_sm_config c = (method == METHOD_EXTCLK)
         ? extclk_program_get_default_config(offset)
-        : (driven ? MP_DRV_CFG(offset)
-          : pullup ? glitch_pu_program_get_default_config(offset)
-                   : glitch_program_get_default_config(offset));
+        : glitch_program_get_default_config(offset);
     sm_config_set_set_pins(&c, CPU_RESET, 2);   /* bit0 = RESET, bit1 = PLL/EXTC */
-#ifndef MP_T_SET
     if (driven) sm_config_set_sideset_pins(&c, CPU_RESET);
-#endif
 
     pio_gpio_init(pio, CPU_RESET);
     gpio_disable_pulls(CPU_RESET);
@@ -364,11 +350,11 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
     gpio_set_slew_rate(PLL_BYPASS, GPIO_SLEW_RATE_FAST);
     gpio_set_drive_strength(PLL_BYPASS, GPIO_DRIVE_STRENGTH_12MA);
 
-    /* Both latches low. PLL is an output; RESET starts as an INPUT (floating)
-     * so we never hold the 1.1V reset line at 3.3V. glitch.pio only switches
-     * RESET to output for the pulse plus one pull-up cycle. */
+    /* RGH 1.2: arming only happens once the console itself has raised reset, so
+     * we start by driving it HIGH (matching the console) and PLL LOW. Both pins
+     * go back to inputs the moment the glitch finishes.
+     * EXT_CLK: reset stays an input (floating); only EXT_CLK_EN is driven. */
     if (driven) {
-        /* TEST BUILD: original PicoRGH behaviour, reset driven HIGH for the window. */
         pio_sm_set_pins_with_mask(pio, sm, (1u << CPU_RESET),
                                   (1u << CPU_RESET) | (1u << PLL_BYPASS));
         pio_sm_set_pindirs_with_mask(pio, sm, (1u << CPU_RESET) | (1u << PLL_BYPASS),
@@ -394,7 +380,7 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
     pio_sm_put_blocking(pio, sm, t[0]);                      /* post_count */
     pio_sm_put_blocking(pio, sm, t[1]);                      /* delay_to_pll / slow_delay */
     pio_sm_put_blocking(pio, sm, t[2]);                      /* delay_to_rst / r_end */
-    pio_sm_put_blocking(pio, sm, driven ? MP_DRV_WIDTH(t[3]) : (t[3] > 0 ? t[3] - 1 : 0));   /* glitch_width / pulse_width */
+    pio_sm_put_blocking(pio, sm, driven ? t[3] : (t[3] > 0 ? t[3] - 1 : 0));   /* glitch_width / pulse_width */
     pio_sm_put_blocking(pio, sm, t[4]);                      /* pll_hold / extc_hold */
 
     while (pio_sm_is_rx_fifo_empty(pio, sm))
@@ -481,12 +467,10 @@ static void core1_main(void)
     /* Safety: drive the slowdown line (PLL_BYPASS / EXT_CLK_EN) to its inactive
      * LOW state from the very start, so it is never left floating at the console
      * during the window before the first arm. The reset pin stays an input
-     * (floating) - it must never source voltage into the 1.1V net. */
-#ifndef MP_T_NOPLL
+     * until the console itself has raised reset and we arm (see run_glitch_once). */
     gpio_init(PLL_BYPASS);
     gpio_put(PLL_BYPASS, 0);
     gpio_set_dir(PLL_BYPASS, GPIO_OUT);
-#endif
     gpio_init(CPU_RESET);
     gpio_set_dir(CPU_RESET, GPIO_IN);
 
@@ -496,13 +480,10 @@ static void core1_main(void)
     uint offset = 0;
 
     while (true) {
-        /* (Re)load the engine for the active profile. Programs don't fit in one
-         * PIO at once, so we swap when the engine changes:
-         *   0 = RGH1.2 open-drain, 1 = EXT_CLK, 2 = RGH1.2 + 1-cycle pull-up (rstpull 1). */
+        /* (Re)load the engine for the active profile (0 = RGH1.2, 1 = EXT_CLK);
+         * the two programs don't fit in one PIO together, so we swap on change. */
         uint m = g_cfg.profiles[g_cfg.active].method;
-        bool pullup = (m != METHOD_EXTCLK) && (g_cfg.reserved & 1u);
-        bool driven = (m != METHOD_EXTCLK) && (g_cfg.reserved & 2u);
-        int eng = (m == METHOD_EXTCLK) ? 1 : (driven ? 3 : (pullup ? 2 : 0));
+        int eng = (m == METHOD_EXTCLK) ? 1 : 0;
         if (eng != loaded) {
             if (loaded >= 0) {
                 pio_sm_set_enabled(pio, sm, false);
@@ -511,7 +492,7 @@ static void core1_main(void)
             offset = pio_add_program(pio, eng_prog(eng));
             loaded = eng;
         }
-        run_glitch_once(pio, sm, offset, m, pullup, driven);
+        run_glitch_once(pio, sm, offset, m);
     }
 }
 
@@ -564,8 +545,6 @@ static void print_help(void)
         "  save                 write all profiles to flash (persists)\n"
         "  load                 reload profiles from flash (discard edits)\n"
         "  defaults             restore built-in defaults (not saved yet)\n"
-        "  opt [name 0|1]       diagnostic options: driven, postpull, rstpull\n"
-        "  rstpull [0|1]        RGH1.2 reset 1-cycle pull-up (diagnostic, default 0=safe)\n"
         "  hist                 last 16 attempts: POST edges + how long reset stayed high\n"
         "  last                 POST edges counted after the last glitch\n"
         "  bootedges [n]        POST edges needed to count as a real boot (default 3)\n"
@@ -638,30 +617,6 @@ static void handle_line(char *line)
     } else if (!strcmp(cmd, "defaults")) {
         memcpy(&g_cfg, &DEFAULT_CONFIG, sizeof(config_t));
         printf("defaults restored (unsaved; 'save' to persist).\n");
-    } else if (!strcmp(cmd, "rstpull")) {
-        char *a = strtok(NULL, " \t");
-        if (a) {
-            if (atoi(a)) g_cfg.reserved |= 1u; else g_cfg.reserved &= ~1u;
-        }
-        printf("rstpull = %u  (%s; 'save' to persist)\n", (unsigned)(g_cfg.reserved & 1u),
-               (g_cfg.reserved & 1u) ? "1-cycle 3.3V pull-up ON - bench diagnostic only"
-                                      : "pure open-drain, safe default");
-    } else if (!strcmp(cmd, "opt")) {
-        char *a = strtok(NULL, " \t"), *b = strtok(NULL, " \t");
-        if (a && b) {
-            uint32_t bit = !strcmp(a, "driven") ? 2u : !strcmp(a, "postpull") ? 4u
-                         : !strcmp(a, "rstpull") ? 1u : 0u;
-            if (!bit) printf("unknown option '%s'\n", a);
-            else if (atoi(b)) g_cfg.reserved |= bit; else g_cfg.reserved &= ~bit;
-            gpio_set_pulls(POST_PIN, false, (g_cfg.reserved & 4u) != 0);
-        }
-        printf("options (usage: opt <driven|postpull|rstpull> <0|1>, then 'save'):\n"
-               "  driven   = %u  (1: reset driven HIGH during window like original PicoRGH; 0: open-drain)\n"
-               "  postpull = %u  (1: POST pull-down on like original; 0: POST pure hi-Z)\n"
-               "  rstpull  = %u  (open-drain only: 1-cycle pull-up)\n"
-               "  clock    = %u kHz\n",
-               (unsigned)!!(g_cfg.reserved & 2u), (unsigned)!!(g_cfg.reserved & 4u),
-               (unsigned)!!(g_cfg.reserved & 1u), (unsigned)MP_SYS_CLK_KHZ);
     } else if (!strcmp(cmd, "hist")) {
         uint32_t n = g_hist_n, from = n > 16 ? n - 16 : 0;
         printf("attempt  POST-edges@4s    total-edges  reset-high-time\n");
@@ -773,15 +728,14 @@ int main(void)
 
     stdio_init_all();      /* USB CDC serial console */
 
-    /* POST is a pure high-impedance input: input enabled, pulls OFF, never
-     * driven. So wiring GP28 straight to a 1.1V POST net is electrically safe
-     * with no diode - the Pico only sinks input leakage (~uA), it cannot drive
-     * or load the net. (Whether a 1.1V high READS is a separate question - see
-     * docs/SAFETY.md; on phat it is below the Pico's threshold.) */
+    /* POST (GP28) is only ever an INPUT - never driven. The pad keeps the RP2040's
+     * default weak pull-down, same as the original PicoRGH, so an unconnected wire
+     * reads low. It can only sink microamps from the POST net. (Whether a low-voltage
+     * POST net reads as a logic high is a separate question - see docs/SAFETY.md.) */
     gpio_set_input_enabled(POST_PIN, true);
     config_load();
     /* DIAG: option bit2 = POST pull-down (reset default of the RP2040 pad). */
-    gpio_set_pulls(POST_PIN, false, (g_cfg.reserved & 4u) != 0);
+    gpio_set_pulls(POST_PIN, false, true);   /* chip default (pull-down), as in the proven build */
 
     multicore_launch_core1(core1_main);
 

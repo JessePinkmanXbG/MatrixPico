@@ -1,170 +1,22 @@
-; Matrix Pico glitch program (RGH 1.2)
-;
-; Derived from PicoRGH by Balázs Triszka <balika011@gmail.com> (GPLv2).
-; Timing sequence unchanged; reset-line drive changed for safety.
+; Copyright (c) 2022 Balázs Triszka <balika011@gmail.com>
 ;
 ; This program is free software; you can redistribute it and/or modify it
 ; under the terms and conditions of the GNU General Public License,
 ; version 2, as published by the Free Software Foundation.
 ;
-; SET pins (base = CPU_RESET, count = 2):
-;   bit 0 = CPU_RESET  (output latch held at 0; we switch its DIRECTION)
-;   bit 1 = PLL_BYPASS (normal push-pull output)
+; This program is distributed in the hope it will be useful, but WITHOUT
+; ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+; FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+; more details.
 ;
-; Safety: the CPU reset line is a 1.1V net. The original PicoRGH program held
-; it driven HIGH at 3.3V for the whole glitch window (most of a second per
-; attempt). This version is PURE OPEN-DRAIN: the reset pin is only ever an
-; output to pull LOW (the glitch), otherwise it is an input (floating). It is
-; NEVER driven high, so no 3.3V ever reaches the 1.1V reset net - the line
-; returns high through the console's own pull-up. Same behaviour as the
-; EXT_CLK engine. (If a console will not boot reliably open-drain, the CPLD
-; trick of a 1-cycle pull-up can be restored, but it is off by default because
-; it puts 3.3V on a 1.1V net.)
+; You should have received a copy of the GNU General Public License
+; along with this program.  If not, see <http://www.gnu.org/licenses/>.
 ;
-; POST is read on GPIO 28 (hard-coded below; keep in sync with main.c).
+; Unmodified from the original PicoRGH (X360Tools / balika011). The glitch
+; timing is driven entirely by the five values pushed from the C code, so
+; Matrix Pico tunes behaviour without touching this program.
 
 .program glitch
-
-	pull block                  ; x = post_count
-	mov x, osr
-	pull block                  ; y = delay_to_pll
-	mov y, osr
-
-wait_for_post_loop:
-	wait 1 gpio 28
-	wait 0 gpio 28
-	jmp x-- wait_for_post_loop
-
-delay_pll:
-	jmp y-- delay_pll
-
-	set pins, 0b10              ; PLL bypass HIGH, reset still floating
-
-	pull block                  ; x = delay_to_rst
-	mov x, osr
-	pull block                  ; y = glitch_width (C side passes width-1)
-	mov y, osr
-
-	wait 1 gpio 28
-
-delay_rst:
-	jmp x-- delay_rst
-
-	set pindirs, 0b11           ; reset becomes output -> pulled LOW (glitch)
-hold_rst:
-	jmp y-- hold_rst
-
-	set pindirs, 0b10           ; reset back to INPUT -> FLOAT (open-drain, no 3.3V)
-
-	pull block                  ; x = pll_hold
-	mov x, osr
-hold_pll:
-	jmp x-- hold_pll
-
-	set pins, 0b00              ; PLL bypass LOW
-	push block                  ; tell the C side we're done
-
-
-; ---------------------------------------------------------------------------
-; Variant used only when 'rstpull 1' is set (bench diagnostic, default OFF).
-; Identical to the program above except for a 1-cycle active pull-up after the
-; glitch. This puts 3.3V on the reset net for ~5 ns each attempt - the same
-; thing the original PicoRGH/CPLD designs do. Leave OFF unless needed.
-; ---------------------------------------------------------------------------
-
-.program glitch_pu
-
-	pull block                  ; x = post_count
-	mov x, osr
-	pull block                  ; y = delay_to_pll
-	mov y, osr
-
-wait_for_post_loop:
-	wait 1 gpio 28
-	wait 0 gpio 28
-	jmp x-- wait_for_post_loop
-
-delay_pll:
-	jmp y-- delay_pll
-
-	set pins, 0b10              ; PLL bypass HIGH, reset still floating
-
-	pull block                  ; x = delay_to_rst
-	mov x, osr
-	pull block                  ; y = glitch_width (C side passes width-1)
-	mov y, osr
-
-	wait 1 gpio 28
-
-delay_rst:
-	jmp x-- delay_rst
-
-	set pindirs, 0b11           ; reset becomes output -> pulled LOW (glitch)
-hold_rst:
-	jmp y-- hold_rst
-
-	set pins, 0b11              ; DIAGNOSTIC: drive reset HIGH for exactly 1 cycle (fast edge)
-	set pindirs, 0b10           ; then release to INPUT -> FLOAT
-	set pins, 0b10              ; latch back low so the next attempt starts correctly
-
-	pull block                  ; x = pll_hold
-	mov x, osr
-hold_pll:
-	jmp x-- hold_pll
-
-	set pins, 0b00              ; PLL bypass LOW
-	push block                  ; tell the C side we're done
-
-
-; ---------------------------------------------------------------------------
-; TEST-ONLY variant (MP_RST_DRIVEN=1): the original PicoRGH behaviour with the
-; reset line DRIVEN push-pull (high during the window, low for the glitch).
-; Used only to find out whether the console needs a driven reset edge. Not the
-; release engine.
-; ---------------------------------------------------------------------------
-.program glitch_drv
-
-	pull block
-	mov x, osr
-	pull block
-	mov y, osr
-
-wait_for_post_loop:
-	wait 1 gpio 28
-	wait 0 gpio 28
-	jmp x-- wait_for_post_loop
-
-delay_pll:
-	jmp y-- delay_pll
-
-	set pins, 0b11              ; PLL bypass HIGH, reset stays driven high
-
-	pull block
-	mov x, osr
-	pull block
-	mov y, osr
-
-	wait 1 gpio 28
-
-delay_rst:
-	jmp x-- delay_rst
-
-	set pins, 0b10              ; reset LOW (the glitch), PLL high
-hold_rst:
-	jmp y-- hold_rst
-
-	set pins, 0b11              ; reset driven high again
-
-	pull block
-	mov x, osr
-hold_pll:
-	jmp x-- hold_pll
-
-	set pins, 0b01              ; PLL low, reset high
-	push block
-
-; TEST-ONLY: the unmodified original PicoRGH program (side-set), for bisecting.
-.program glitch_side
 .side_set 2
 
 	pull                        side 0x1
