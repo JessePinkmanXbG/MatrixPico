@@ -241,7 +241,12 @@ static inline void led_green(void) { gpio_put(LED_PIN, 1); }
 
 /* ---- Glitch core (core1) ------------------------------------------------ */
 
-static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
+static const pio_program_t *eng_prog(int e)
+{
+    return (e == 1) ? &extclk_program : (e == 2) ? &glitch_pu_program : &glitch_program;
+}
+
+static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pullup)
 {
     if (sweep_active)
         g_cfg.profiles[g_cfg.active].t[sweep_idx] = sweep_val;
@@ -259,7 +264,8 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
 
     pio_sm_config c = (method == METHOD_EXTCLK)
         ? extclk_program_get_default_config(offset)
-        : glitch_program_get_default_config(offset);
+        : (pullup ? glitch_pu_program_get_default_config(offset)
+                  : glitch_program_get_default_config(offset));
     sm_config_set_set_pins(&c, CPU_RESET, 2);   /* bit0 = RESET, bit1 = PLL/EXTC */
 
     pio_gpio_init(pio, CPU_RESET);
@@ -377,21 +383,21 @@ static void core1_main(void)
     uint offset = 0;
 
     while (true) {
-        /* (Re)load the engine for the active profile's method. Both programs
-         * don't fit in one PIO at once, so we swap when the method changes. */
+        /* (Re)load the engine for the active profile. Programs don't fit in one
+         * PIO at once, so we swap when the engine changes:
+         *   0 = RGH1.2 open-drain, 1 = EXT_CLK, 2 = RGH1.2 + 1-cycle pull-up (rstpull 1). */
         uint m = g_cfg.profiles[g_cfg.active].method;
-        if ((int)m != loaded) {
+        bool pullup = (m != METHOD_EXTCLK) && (g_cfg.reserved & 1u);
+        int eng = (m == METHOD_EXTCLK) ? 1 : (pullup ? 2 : 0);
+        if (eng != loaded) {
             if (loaded >= 0) {
                 pio_sm_set_enabled(pio, sm, false);
-                pio_remove_program(pio,
-                    (loaded == METHOD_EXTCLK) ? &extclk_program : &glitch_program,
-                    offset);
+                pio_remove_program(pio, eng_prog(loaded), offset);
             }
-            offset = pio_add_program(pio,
-                (m == METHOD_EXTCLK) ? &extclk_program : &glitch_program);
-            loaded = (int)m;
+            offset = pio_add_program(pio, eng_prog(eng));
+            loaded = eng;
         }
-        run_glitch_once(pio, sm, offset, m);
+        run_glitch_once(pio, sm, offset, m, pullup);
     }
 }
 
@@ -444,6 +450,7 @@ static void print_help(void)
         "  save                 write all profiles to flash (persists)\n"
         "  load                 reload profiles from flash (discard edits)\n"
         "  defaults             restore built-in defaults (not saved yet)\n"
+        "  rstpull [0|1]        RGH1.2 reset 1-cycle pull-up (diagnostic, default 0=safe)\n"
         "  attempts             reset the attempt counter\n"
         "  mon                  watch CPU_RESET/POST live for 6s (power-cycle to test)\n"
         "  sweep <i> <a> <b> [s] auto-step timing i from a to b until it boots\n"
@@ -513,6 +520,14 @@ static void handle_line(char *line)
     } else if (!strcmp(cmd, "defaults")) {
         memcpy(&g_cfg, &DEFAULT_CONFIG, sizeof(config_t));
         printf("defaults restored (unsaved; 'save' to persist).\n");
+    } else if (!strcmp(cmd, "rstpull")) {
+        char *a = strtok(NULL, " \t");
+        if (a) {
+            if (atoi(a)) g_cfg.reserved |= 1u; else g_cfg.reserved &= ~1u;
+        }
+        printf("rstpull = %u  (%s; 'save' to persist)\n", (unsigned)(g_cfg.reserved & 1u),
+               (g_cfg.reserved & 1u) ? "1-cycle 3.3V pull-up ON - bench diagnostic only"
+                                      : "pure open-drain, safe default");
     } else if (!strcmp(cmd, "attempts")) {
         g_attempts = 0;
         printf("attempt counter reset.\n");

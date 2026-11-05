@@ -63,3 +63,54 @@ hold_pll:
 
 	set pins, 0b00              ; PLL bypass LOW
 	push block                  ; tell the C side we're done
+
+
+; ---------------------------------------------------------------------------
+; Variant used only when 'rstpull 1' is set (bench diagnostic, default OFF).
+; Identical to the program above except for a 1-cycle active pull-up after the
+; glitch. This puts 3.3V on the reset net for ~5 ns each attempt - the same
+; thing the original PicoRGH/CPLD designs do. Leave OFF unless needed.
+; ---------------------------------------------------------------------------
+
+.program glitch_pu
+
+	pull block                  ; x = post_count
+	mov x, osr
+	pull block                  ; y = delay_to_pll
+	mov y, osr
+
+wait_for_post_loop:
+	wait 1 gpio 28
+	wait 0 gpio 28
+	jmp x-- wait_for_post_loop
+
+delay_pll:
+	jmp y-- delay_pll
+
+	set pins, 0b10              ; PLL bypass HIGH, reset still floating
+
+	pull block                  ; x = delay_to_rst
+	mov x, osr
+	pull block                  ; y = glitch_width (C side passes width-1)
+	mov y, osr
+
+	wait 1 gpio 28
+
+delay_rst:
+	jmp x-- delay_rst
+
+	set pindirs, 0b11           ; reset becomes output -> pulled LOW (glitch)
+hold_rst:
+	jmp y-- hold_rst
+
+	set pins, 0b11              ; DIAGNOSTIC: drive reset HIGH for exactly 1 cycle (fast edge)
+	set pindirs, 0b10           ; then release to INPUT -> FLOAT
+	set pins, 0b10              ; latch back low so the next attempt starts correctly
+
+	pull block                  ; x = pll_hold
+	mov x, osr
+hold_pll:
+	jmp x-- hold_pll
+
+	set pins, 0b00              ; PLL bypass LOW
+	push block                  ; tell the C side we're done
