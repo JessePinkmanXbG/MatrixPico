@@ -9,6 +9,11 @@ set(CMAKE_CXX_STANDARD 17)
 
 pico_sdk_init()
 
+# Test-variant builds: MP_DEFS="MP_SYS_CLK_KHZ=200000;MP_RST_DRIVEN=1"
+if(DEFINED ENV{MP_DEFS})
+  add_compile_definitions($ENV{MP_DEFS})
+endif()
+
 add_executable(${PROJECT_NAME}
     main.c
 )

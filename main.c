@@ -73,13 +73,15 @@
 #define METHOD_RGH12   0   /* Trinity/Corona/Falcon/Jasper - PLL bypass */
 #define METHOD_EXTCLK  1   /* Xenon/Zephyr - EXT_CLK_EN slowdown */
 
-#define MP_SYS_CLK_KHZ 192000   /* multiple of 12/48 MHz; 4 cycles per STBY_CLK */
+#ifndef MP_SYS_CLK_KHZ
+#define MP_SYS_CLK_KHZ 200000   /* ~5 ns per PIO cycle; hardware-validated on Trinity */
+#endif
 
 /* ---- Profiles ----------------------------------------------------------- */
 #define NUM_TIMINGS     5
 #define NUM_PROFILES    6
 #define PROFILE_NAME_LEN 16
-#define CONFIG_MAGIC    0x4D505836u   /* "MPX6" - bump if layout/clock changes */
+#define CONFIG_MAGIC    0x4D505837u   /* "MPX7" - bump if layout/clock/engine changes */
 #define CONFIG_MAGIC_V5 0x4D505835u   /* "MPX5" - 5-profile layout, migrated on load */
 #define NUM_PROFILES_V5 5
 #define CONFIG_VERSION  1
@@ -136,6 +138,12 @@ _Static_assert(sizeof(config_t) <= 256, "config must fit one flash page");
  * with the Trinity values only so the firmware has something to run; they are
  * NOT verified for those boards and MUST be dialed in before they are trusted.
  */
+#if MP_SYS_CLK_KHZ == 200000
+#define TRI_T { 3, 108786906, 7288000, 47, 50000 }    /* proven 200 MHz values */
+#else
+#define TRI_T { 3, 104435430, 6996480, 45, 48000 }    /* same real-time at 192 MHz */
+#endif
+
 static const config_t DEFAULT_CONFIG = {
     .magic   = CONFIG_MAGIC,
     .version = CONFIG_VERSION,
@@ -144,10 +152,10 @@ static const config_t DEFAULT_CONFIG = {
     .profiles = {
         /* RGH 1.2, 192 MHz values (200 MHz x 0.96, same real-time timing).
          * trinity carries balika011's proven numbers; others are seeds. */
-        { "trinity", METHOD_RGH12,  { 3, 104435430, 6996480, 45, 48000 } },
-        { "corona",  METHOD_RGH12,  { 3, 104435430, 6996480, 45, 48000 } },  /* dial in */
-        { "jasper",  METHOD_RGH12,  { 3, 104435430, 6996480, 45, 48000 } },  /* dial in */
-        { "falcon",  METHOD_RGH12,  { 3, 104435430, 6996480, 45, 48000 } },  /* dial in */
+        { "trinity", METHOD_RGH12,  TRI_T },
+        { "corona",  METHOD_RGH12,  TRI_T },  /* dial in */
+        { "jasper",  METHOD_RGH12,  TRI_T },  /* dial in */
+        { "falcon",  METHOD_RGH12,  TRI_T },  /* dial in */
         /* EXT_CLK seeds from Octal450's Zephyr VHDL @192MHz: r_end 118008,
          * pulse 2, slow_delay ~382ms (73,344,000 cyc), T_BUF 50000, ~12 pulses.
          * These are STRUCTURAL SEEDS - must be dialed in on hardware. */
@@ -168,6 +176,11 @@ static const uint8_t *g_flash_cfg = (const uint8_t *)(XIP_BASE + FLASH_TARGET_OF
 
 /* Shared glitch counter so the console can report activity. */
 static volatile uint32_t g_attempts = 0;
+typedef struct { uint32_t e15, etot, ms; uint8_t done; absolute_time_t t0; } hist_t;
+static hist_t g_hist[16];
+static volatile uint32_t g_hist_n = 0;       /* attempts started since boot */
+static volatile uint32_t g_last_edges = 0;   /* POST edges seen 4s after the last glitch */
+static volatile uint32_t g_boot_edges = 3;   /* edges needed to call it a real boot */
 
 /* Sweep (auto-tune) state, shared core0 <-> core1. When active, core1 applies
  * sweep_val to the active profile's timing[sweep_idx] on each attempt and steps
@@ -190,7 +203,8 @@ static void config_load(void)
     if (fc->magic == CONFIG_MAGIC && fc->version == CONFIG_VERSION &&
         fc->active < NUM_PROFILES) {
         memcpy(&g_cfg, fc, sizeof(config_t));
-    } else if (fc->magic == CONFIG_MAGIC_V5 && fc->version == CONFIG_VERSION &&
+    } else if (0 &&
+               fc->magic == CONFIG_MAGIC_V5 && fc->version == CONFIG_VERSION &&
                fc->active < NUM_PROFILES_V5) {
         /* Old 5-profile save: keep the user's tuned profiles, add the new ones. */
         memcpy(&g_cfg, &DEFAULT_CONFIG, sizeof(config_t));
@@ -232,17 +246,82 @@ static void led_init(void) {
 static inline void led_off(void)   { led_raw(0); }
 static inline void led_blue(void)  { led_raw(led_rgb(0, 0, 24)); }
 static inline void led_green(void) { led_raw(led_rgb(0, 24, 0)); }
+static inline void led_red(void)   { led_raw(led_rgb(24, 0, 0)); }
 #else
 static void led_init(void) { gpio_init(LED_PIN); gpio_set_dir(LED_PIN, GPIO_OUT); }
 static inline void led_off(void)   { gpio_put(LED_PIN, 0); }
 static inline void led_blue(void)  { gpio_put(LED_PIN, 1); }
 static inline void led_green(void) { gpio_put(LED_PIN, 1); }
+static inline void led_red(void)   { gpio_put(LED_PIN, 1); }
 #endif
 
 /* ---- Glitch core (core1) ------------------------------------------------ */
 
+/* ---- LED state machine (core1) ------------------------------------------
+ * Fast blue flicker for 2.5s from the moment we arm; solid green for 5s on a
+ * confirmed boot; red for 1s on a failed attempt. Everything is non-blocking
+ * (except the green hold) so a red/blue phase never delays arming the next try. */
+#define GREEN_GAP_MS 500   /* dark gap between the blue flicker and the green */
+static int g_led_cur = -1;                       /* 0 off, 1 blue, 2 red, 3 green */
+static absolute_time_t g_flick_t0, g_flick_end, g_red_end;   /* zero-init = nil_time */
+
+static void led_set(int c)
+{
+    if (c == g_led_cur) return;
+    g_led_cur = c;
+    switch (c) {
+    case 1:  led_blue();  break;
+    case 2:  led_red();   break;
+    case 3:  led_green(); break;
+    default: led_off();   break;
+    }
+}
+
+static void led_tick(void)
+{
+    absolute_time_t n = get_absolute_time();
+    if (absolute_time_diff_us(n, g_red_end) > 0) { led_set(2); return; }
+    if (absolute_time_diff_us(n, g_flick_end) > 0) {
+        int64_t el = absolute_time_diff_us(g_flick_t0, n);
+        led_set(((el / 17000) & 1) == 0 ? 1 : 0);
+        return;
+    }
+    led_set(0);
+}
+
+static void led_flicker_start(void)
+{
+    g_flick_t0 = get_absolute_time();
+    g_flick_end = delayed_by_ms(g_flick_t0, 2500);
+}
+
+static void led_red_for(uint ms)
+{
+    g_red_end = make_timeout_time_ms(ms);
+    led_tick();
+}
+
+static void led_green_hold(void)               /* confirmed boot: solid green 5s */
+{
+    g_red_end = nil_time;
+    g_flick_end = nil_time;
+    led_set(3);
+    sleep_ms(5000);
+    led_set(0);
+}
+
+
+static const pio_program_t *eng_prog(int e)
+{
+    return (e == 1) ? &extclk_program : &glitch_program;
+}
+
 static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
 {
+    /* RGH 1.2 uses the original PicoRGH program, which drives CPU_RESET (high
+     * between pulses, low for the glitch). EXT_CLK keeps its open-drain engine. */
+    const bool driven = (method != METHOD_EXTCLK);
+
     if (sweep_active)
         g_cfg.profiles[g_cfg.active].t[sweep_idx] = sweep_val;
 
@@ -255,12 +334,13 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
     gpio_init(arm_pin);
     gpio_set_dir(arm_pin, GPIO_IN);
     while (!gpio_get(arm_pin))
-        tight_loop_contents();
+        led_tick();                       /* lets a red phase time out while we wait */
 
     pio_sm_config c = (method == METHOD_EXTCLK)
         ? extclk_program_get_default_config(offset)
         : glitch_program_get_default_config(offset);
     sm_config_set_set_pins(&c, CPU_RESET, 2);   /* bit0 = RESET, bit1 = PLL/EXTC */
+    if (driven) sm_config_set_sideset_pins(&c, CPU_RESET);
 
     pio_gpio_init(pio, CPU_RESET);
     gpio_disable_pulls(CPU_RESET);
@@ -271,69 +351,94 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
     gpio_set_slew_rate(PLL_BYPASS, GPIO_SLEW_RATE_FAST);
     gpio_set_drive_strength(PLL_BYPASS, GPIO_DRIVE_STRENGTH_12MA);
 
-    /* Both latches low. PLL is an output; RESET starts as an INPUT (floating)
-     * so we never hold the 1.1V reset line at 3.3V. glitch.pio only switches
-     * RESET to output for the pulse plus one pull-up cycle. */
-    pio_sm_set_pins_with_mask(pio, sm, 0u,
-                              (1u << CPU_RESET) | (1u << PLL_BYPASS));
-    pio_sm_set_pindirs_with_mask(pio, sm, (1u << PLL_BYPASS),
-                                 (1u << CPU_RESET) | (1u << PLL_BYPASS));
+    /* RGH 1.2: arming only happens once the console itself has raised reset, so
+     * we start by driving it HIGH (matching the console) and PLL LOW. Both pins
+     * go back to inputs the moment the glitch finishes.
+     * EXT_CLK: reset stays an input (floating); only EXT_CLK_EN is driven. */
+    if (driven) {
+        pio_sm_set_pins_with_mask(pio, sm, (1u << CPU_RESET),
+                                  (1u << CPU_RESET) | (1u << PLL_BYPASS));
+        pio_sm_set_pindirs_with_mask(pio, sm, (1u << CPU_RESET) | (1u << PLL_BYPASS),
+                                     (1u << CPU_RESET) | (1u << PLL_BYPASS));
+    } else {
+        pio_sm_set_pins_with_mask(pio, sm, 0u,
+                                  (1u << CPU_RESET) | (1u << PLL_BYPASS));
+        pio_sm_set_pindirs_with_mask(pio, sm, (1u << PLL_BYPASS),
+                                     (1u << CPU_RESET) | (1u << PLL_BYPASS));
+    }
 
     pio_sm_init(pio, sm, offset, &c);
     pio_sm_set_enabled(pio, sm, true);
 
-    /* Fast blue flashing during the arm window (before the glitch pulse), so
-     * repeated attempts show as a rapid blue flicker. ~200ms total. */
-    for (int i = 0; i < 6; i++) {
-        led_blue();
-        sleep_ms(17);
-        led_off();
-        sleep_ms(17);
-    }
+    led_flicker_start();      /* 2.5s fast blue flicker, non-blocking */
+    /* The proven build waited ~200ms here before sending the timing values; keep
+     * that so POST counting starts at exactly the same moment. */
+    { absolute_time_t dl = delayed_by_ms(get_absolute_time(), 204);
+      while (absolute_time_diff_us(get_absolute_time(), dl) > 0) led_tick(); }
 
     /* Same 5-value feed for both engines (slots mean different things per
      * method). Reset-low lasts (y + 1) cycles, so pass width-1. */
     pio_sm_put_blocking(pio, sm, t[0]);                      /* post_count */
     pio_sm_put_blocking(pio, sm, t[1]);                      /* delay_to_pll / slow_delay */
     pio_sm_put_blocking(pio, sm, t[2]);                      /* delay_to_rst / r_end */
-    pio_sm_put_blocking(pio, sm, t[3] > 0 ? t[3] - 1 : 0);   /* glitch_width / pulse_width */
+    pio_sm_put_blocking(pio, sm, driven ? t[3] : (t[3] > 0 ? t[3] - 1 : 0));   /* glitch_width / pulse_width */
     pio_sm_put_blocking(pio, sm, t[4]);                      /* pll_hold / extc_hold */
 
-    pio_sm_get_blocking(pio, sm);         /* wait for the glitch to complete */
+    while (pio_sm_is_rx_fifo_empty(pio, sm))
+        led_tick();
+    pio_sm_get_blocking(pio, sm);         /* glitch complete */
 
     pio_sm_set_enabled(pio, sm, false);
     pio_sm_restart(pio, sm);
 
-    led_off();
-
     gpio_init(arm_pin);
     gpio_set_dir(arm_pin, GPIO_IN);
 
-    /* If the reset-sense line stays high, the console booted: flash green
-     * briefly, then go dark. If it drops quickly, the glitch missed and we
-     * loop round for another attempt. */
+    /* A hung (failed) glitch also leaves reset high for seconds, so reset-high
+     * alone is NOT proof of a boot. A real boot keeps changing POST codes, so we
+     * count POST edges for 4s after the glitch and require g_boot_edges of
+     * them. The count is exposed via the 'last' command for calibration. */
     absolute_time_t t0 = get_absolute_time();
-    bool shown = false;
+    hist_t *hh = &g_hist[g_hist_n % 16];
+    hh->e15 = 0; hh->etot = 0; hh->ms = 0; hh->done = 0; hh->t0 = t0;
+    g_hist_n++;
+    bool judged = false;
     bool booted = false;
+    bool red_done = false;
+    uint32_t edges = 0;
+    bool lastp = gpio_get(POST_PIN);
     while (gpio_get(arm_pin)) {
-        if (!shown && absolute_time_diff_us(t0, get_absolute_time()) > 1500000) {
+        bool p = gpio_get(POST_PIN);
+        if (p != lastp) { edges++; lastp = p; hh->etot = edges; }
+        led_tick();
+        /* Green as soon as the POST edges prove a boot - but never before the 2.5s
+         * blue flicker has finished plus a short dark gap (GREEN_GAP_MS), so the
+         * sequence always reads blue -> pause -> green. */
+        if (!judged && edges >= g_boot_edges &&
+            absolute_time_diff_us(get_absolute_time(), delayed_by_ms(g_flick_end, GREEN_GAP_MS)) <= 0) {
+            judged = true;
+            g_last_edges = edges;
+            hh->e15 = edges;
             booted = true;
-            /* boot confirmed: flash blue 2.5s, then solid green 5s, then off */
-            absolute_time_t s0 = get_absolute_time();
-            while (absolute_time_diff_us(s0, get_absolute_time()) < 2500000) {
-                led_blue();
-                sleep_ms(100);
-                led_off();
-                sleep_ms(100);
-            }
-            led_green();
-            sleep_ms(5000);
-            led_off();
-            shown = true;
+            led_green_hold();
         }
-        tight_loop_contents();
+        if (!judged && absolute_time_diff_us(t0, get_absolute_time()) > 4000000) {
+            judged = true;
+            g_last_edges = edges;
+            hh->e15 = edges;
+            if (edges >= g_boot_edges) {
+                booted = true;
+                led_green_hold();          /* boot confirmed: solid green 5s */
+            } else {
+                led_red_for(1000);         /* hung: red 1s, keep waiting for the reset */
+                red_done = true;
+            }
+        }
     }
-    led_off();
+    hh->ms = (uint32_t)(absolute_time_diff_us(t0, get_absolute_time()) / 1000);
+    hh->done = 1;
+    if (!judged) { g_last_edges = edges; hh->e15 = edges; }   /* reset dropped before 4s: a miss */
+    if (!booted && !red_done) led_red_for(1000);
 
     if (sweep_active) {
         if (booted) {
@@ -364,7 +469,7 @@ static void core1_main(void)
     /* Safety: drive the slowdown line (PLL_BYPASS / EXT_CLK_EN) to its inactive
      * LOW state from the very start, so it is never left floating at the console
      * during the window before the first arm. The reset pin stays an input
-     * (floating) - it must never source voltage into the 1.1V net. */
+     * until the console itself has raised reset and we arm (see run_glitch_once). */
     gpio_init(PLL_BYPASS);
     gpio_put(PLL_BYPASS, 0);
     gpio_set_dir(PLL_BYPASS, GPIO_OUT);
@@ -377,19 +482,17 @@ static void core1_main(void)
     uint offset = 0;
 
     while (true) {
-        /* (Re)load the engine for the active profile's method. Both programs
-         * don't fit in one PIO at once, so we swap when the method changes. */
+        /* (Re)load the engine for the active profile (0 = RGH1.2, 1 = EXT_CLK);
+         * the two programs don't fit in one PIO together, so we swap on change. */
         uint m = g_cfg.profiles[g_cfg.active].method;
-        if ((int)m != loaded) {
+        int eng = (m == METHOD_EXTCLK) ? 1 : 0;
+        if (eng != loaded) {
             if (loaded >= 0) {
                 pio_sm_set_enabled(pio, sm, false);
-                pio_remove_program(pio,
-                    (loaded == METHOD_EXTCLK) ? &extclk_program : &glitch_program,
-                    offset);
+                pio_remove_program(pio, eng_prog(loaded), offset);
             }
-            offset = pio_add_program(pio,
-                (m == METHOD_EXTCLK) ? &extclk_program : &glitch_program);
-            loaded = (int)m;
+            offset = pio_add_program(pio, eng_prog(eng));
+            loaded = eng;
         }
         run_glitch_once(pio, sm, offset, m);
     }
@@ -444,6 +547,9 @@ static void print_help(void)
         "  save                 write all profiles to flash (persists)\n"
         "  load                 reload profiles from flash (discard edits)\n"
         "  defaults             restore built-in defaults (not saved yet)\n"
+        "  hist                 last 16 attempts: POST edges + how long reset stayed high\n"
+        "  last                 POST edges counted after the last glitch\n"
+        "  bootedges [n]        POST edges needed to count as a real boot (default 3)\n"
         "  attempts             reset the attempt counter\n"
         "  mon                  watch CPU_RESET/POST live for 6s (power-cycle to test)\n"
         "  sweep <i> <a> <b> [s] auto-step timing i from a to b until it boots\n"
@@ -513,6 +619,25 @@ static void handle_line(char *line)
     } else if (!strcmp(cmd, "defaults")) {
         memcpy(&g_cfg, &DEFAULT_CONFIG, sizeof(config_t));
         printf("defaults restored (unsaved; 'save' to persist).\n");
+    } else if (!strcmp(cmd, "hist")) {
+        uint32_t n = g_hist_n, from = n > 16 ? n - 16 : 0;
+        printf("attempt  POST-edges@4s    total-edges  reset-high-time\n");
+        for (uint32_t k = from; k < n; k++) {
+            hist_t *h = &g_hist[k % 16];
+            uint32_t ms = h->done ? h->ms
+                : (uint32_t)(absolute_time_diff_us(h->t0, get_absolute_time()) / 1000);
+            printf("#%-7lu %-16lu %-12lu %lu ms%s\n", (unsigned long)(k + 1),
+                   (unsigned long)h->e15, (unsigned long)h->etot, (unsigned long)ms,
+                   h->done ? "" : "  (still high = running/booted)");
+        }
+        if (n == 0) printf("no attempts yet\n");
+    } else if (!strcmp(cmd, "last")) {
+        printf("POST edges seen after the last glitch: %lu  (boot needs >= %lu)\n",
+               (unsigned long)g_last_edges, (unsigned long)g_boot_edges);
+    } else if (!strcmp(cmd, "bootedges")) {
+        char *a = strtok(NULL, " \t");
+        if (a) g_boot_edges = (uint32_t)strtoul(a, NULL, 0);
+        printf("bootedges = %lu\n", (unsigned long)g_boot_edges);
     } else if (!strcmp(cmd, "attempts")) {
         g_attempts = 0;
         printf("attempt counter reset.\n");
@@ -605,15 +730,14 @@ int main(void)
 
     stdio_init_all();      /* USB CDC serial console */
 
-    /* POST is a pure high-impedance input: input enabled, pulls OFF, never
-     * driven. So wiring GP28 straight to a 1.1V POST net is electrically safe
-     * with no diode - the Pico only sinks input leakage (~uA), it cannot drive
-     * or load the net. (Whether a 1.1V high READS is a separate question - see
-     * docs/SAFETY.md; on phat it is below the Pico's threshold.) */
+    /* POST (GP28) is only ever an INPUT - never driven. The pad keeps the RP2040's
+     * default weak pull-down, same as the original PicoRGH, so an unconnected wire
+     * reads low. It can only sink microamps from the POST net. (Whether a low-voltage
+     * POST net reads as a logic high is a separate question - see docs/SAFETY.md.) */
     gpio_set_input_enabled(POST_PIN, true);
-    gpio_disable_pulls(POST_PIN);
-
     config_load();
+    /* DIAG: option bit2 = POST pull-down (reset default of the RP2040 pad). */
+    gpio_set_pulls(POST_PIN, false, true);   /* chip default (pull-down), as in the proven build */
 
     multicore_launch_core1(core1_main);
 
