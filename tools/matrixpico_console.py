@@ -256,6 +256,11 @@ class App:
 
     def pick_console(self, name):
         self.selected = name
+        if not self.flash_busy:
+            if name in picoflash.available_boards():
+                self.flash_set(f"{name}: tested firmware ready", "#3cff78")
+            else:
+                self.flash_set(f"{name}: no tested firmware yet", "#ffb84d")
         self.send("use " + name)
         self.send("status")
         for n, b in self.console_btns.items():

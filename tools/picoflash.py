@@ -31,9 +31,21 @@ class FlashError(Exception):
     pass
 
 
-def firmware_path():
+def firmware_dir():
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, "assets", "MatrixPico.uf2")
+    return os.path.join(base, "assets", "firmware")
+
+
+def firmware_path(console):
+    """Each board has its own tested binary: firmware/<console>.uf2."""
+    return os.path.join(firmware_dir(), f"{console}.uf2")
+
+
+def available_boards():
+    try:
+        return sorted(n[:-4] for n in os.listdir(firmware_dir()) if n.endswith(".uf2"))
+    except OSError:
+        return []
 
 
 def validate_uf2(path):
@@ -177,7 +189,9 @@ def configure_console(port, console, log=lambda s: None):
 def flash_pico(console, log=lambda s: None, status=lambda s: None,
                fw=None, wait_bootsel=15.0, wait_port=20.0):
     """Full flash flow. Raises FlashError with a plain-English message."""
-    fw = fw or firmware_path()
+    fw = fw or firmware_path(console)
+    if not os.path.isfile(fw):
+        raise FlashError(f"no tested firmware for {console} yet")
     status("checking firmware...")
     data = validate_uf2(fw)
 
