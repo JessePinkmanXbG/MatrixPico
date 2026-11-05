@@ -424,6 +424,16 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
         bool p = gpio_get(POST_PIN);
         if (p != lastp) { edges++; lastp = p; hh->etot = edges; }
         led_tick();
+        /* Green as soon as the POST edges prove a boot - but never before the 2.5s
+         * blue flicker has finished, so the sequence always reads blue -> green. */
+        if (!judged && edges >= g_boot_edges &&
+            absolute_time_diff_us(get_absolute_time(), g_flick_end) <= 0) {
+            judged = true;
+            g_last_edges = edges;
+            hh->e15 = edges;
+            booted = true;
+            led_green_hold();
+        }
         if (!judged && absolute_time_diff_us(t0, get_absolute_time()) > 4000000) {
             judged = true;
             g_last_edges = edges;
