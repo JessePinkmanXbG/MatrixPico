@@ -243,6 +243,185 @@ static void config_save(void)
     multicore_lockout_end_blocking();
 }
 
+
+/* ---- Autonomous centering (tune mode) -----------------------------------
+ * Each attempt uses a random delay_to_rst (t[2]) inside +-half of the saved
+ * base value, and logs (bucket, booted?) to its own flash sector. Power-cycle
+ * the console ~20 times with NO USB attached; later 'tunelog' shows where it
+ * boots and 'tunecenter' sets t[2] to the middle of that window. The saved
+ * profile is never changed until 'tunecenter'. */
+#define TUNE_OFFSET   (PICO_FLASH_SIZE_BYTES - 2 * FLASH_SECTOR_SIZE)
+#define TUNE_MAGIC    0x54554E32u
+#define TUNE_IDX      2
+#define TUNE_MAX_REC  1920u                       /* (4096-256)/2 */
+#define TUNE_MAX_BKT  601
+typedef struct { uint32_t magic, base, half, step; } tune_hdr_t;
+static const uint8_t *g_tune_flash = (const uint8_t *)(XIP_BASE + TUNE_OFFSET);
+static volatile bool     g_tune_active = false;
+static uint32_t          g_tune_base, g_tune_half, g_tune_step;
+static uint32_t          g_tune_n = 0;            /* records stored */
+static volatile uint32_t g_tune_b = 0;            /* bucket of the running attempt */
+static volatile uint16_t g_tq[16];
+static volatile uint32_t g_tq_h = 0, g_tq_t = 0;
+static uint32_t          g_rng = 2463534242u;
+
+static inline uint32_t tune_nb(void) { return 2u * (g_tune_half / g_tune_step) + 1u; }
+static inline uint32_t tune_val(uint32_t b) { return g_tune_base - g_tune_half + b * g_tune_step; }
+static inline const uint16_t *tune_rec(void) { return (const uint16_t *)(g_tune_flash + 256); }
+
+static void tune_load(void)
+{
+    const tune_hdr_t *h = (const tune_hdr_t *)g_tune_flash;
+    g_tune_active = false;
+    if (h->magic != TUNE_MAGIC || h->step == 0 || h->half == 0 ||
+        h->half / h->step > 300 || h->base < h->half) return;
+    g_tune_base = h->base; g_tune_half = h->half; g_tune_step = h->step;
+    uint32_t n = 0;
+    while (n < TUNE_MAX_REC && tune_rec()[n] != 0xFFFF) n++;
+    g_tune_n = n;
+    g_tune_active = true;
+}
+
+static void tune_flash_page(uint32_t off, const uint8_t *page)
+{
+    multicore_lockout_start_blocking();
+    uint32_t ints = save_and_disable_interrupts();
+    flash_range_program(off, page, FLASH_PAGE_SIZE);
+    restore_interrupts(ints);
+    multicore_lockout_end_blocking();
+}
+
+static void tune_start(uint32_t base, uint32_t half, uint32_t step)
+{
+    uint8_t pg[FLASH_PAGE_SIZE];
+    memset(pg, 0xFF, sizeof(pg));
+    tune_hdr_t h = { TUNE_MAGIC, base, half, step };
+    memcpy(pg, &h, sizeof(h));
+    multicore_lockout_start_blocking();
+    uint32_t ints = save_and_disable_interrupts();
+    flash_range_erase(TUNE_OFFSET, FLASH_SECTOR_SIZE);
+    flash_range_program(TUNE_OFFSET, pg, FLASH_PAGE_SIZE);
+    restore_interrupts(ints);
+    multicore_lockout_end_blocking();
+    tune_load();
+}
+
+static void tune_stop(void)
+{
+    multicore_lockout_start_blocking();
+    uint32_t ints = save_and_disable_interrupts();
+    flash_range_erase(TUNE_OFFSET, FLASH_SECTOR_SIZE);
+    restore_interrupts(ints);
+    multicore_lockout_end_blocking();
+    g_tune_active = false;
+}
+
+/* core1 -> core0 mailbox; core0 does the flash write between attempts. */
+static void tune_post(uint32_t b, bool ok)
+{
+    uint32_t h = g_tq_h;
+    if (h - g_tq_t >= 16) return;
+    g_tq[h % 16] = (uint16_t)((b << 1) | (ok ? 1u : 0u));
+    g_tq_h = h + 1;
+}
+
+static void tune_service(void)
+{
+    while (g_tq_t != g_tq_h) {
+        uint16_t r = g_tq[g_tq_t % 16];
+        g_tq_t++;
+        if (!g_tune_active || g_tune_n >= TUNE_MAX_REC) continue;
+        uint32_t byteoff = 256u + g_tune_n * 2u;
+        uint32_t page = byteoff & ~(uint32_t)(FLASH_PAGE_SIZE - 1);
+        uint8_t pg[FLASH_PAGE_SIZE];
+        memset(pg, 0xFF, sizeof(pg));
+        memcpy(pg + (byteoff - page), &r, 2);
+        tune_flash_page(TUNE_OFFSET + page, pg);
+        g_tune_n++;
+    }
+}
+
+/* Pure analysis, host-testable. succ[]: success count per bucket (nb buckets).
+ * Returns number of successes used; *center_b = middle bucket of the window
+ * after trimming stragglers far from the median. */
+static uint32_t tune_analyze(const uint16_t *succ, uint32_t nb, uint32_t *center_b,
+                             uint32_t *lo_b, uint32_t *hi_b)
+{
+    static uint16_t v[TUNE_MAX_REC];
+    uint32_t n = 0;
+    for (uint32_t b = 0; b < nb; b++)
+        for (uint32_t k = 0; k < succ[b] && n < TUNE_MAX_REC; k++) v[n++] = (uint16_t)b;
+    if (n == 0) return 0;                      /* v[] is already sorted by bucket */
+    uint32_t med = v[n / 2];
+    static uint16_t d[TUNE_MAX_REC];
+    for (uint32_t i = 0; i < n; i++) d[i] = (uint16_t)(v[i] > med ? v[i] - med : med - v[i]);
+    for (uint32_t i = 1; i < n; i++) {         /* insertion sort of deviations */
+        uint16_t x = d[i]; int j = (int)i - 1;
+        while (j >= 0 && d[j] > x) { d[j + 1] = d[j]; j--; }
+        d[j + 1] = x;
+    }
+    uint32_t mad = d[n / 2];
+    uint32_t lim = 4u * (mad < 2 ? 2 : mad);
+    uint32_t mn = 0xFFFFFFFFu, mx = 0, used = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t dv = v[i] > med ? v[i] - med : med - v[i];
+        if (dv > lim) continue;
+        if (v[i] < mn) mn = v[i];
+        if (v[i] > mx) mx = v[i];
+        used++;
+    }
+    *lo_b = mn; *hi_b = mx; *center_b = (mn + mx) / 2;
+    return used;
+}
+
+static void tune_report(bool apply)
+{
+    if (!g_tune_active) { printf("tune mode is not active (use 'tune').\n"); return; }
+    static uint16_t succ[TUNE_MAX_BKT], tries[TUNE_MAX_BKT];
+    uint32_t nb = tune_nb();
+    memset(succ, 0, sizeof(succ)); memset(tries, 0, sizeof(tries));
+    uint32_t okn = 0;
+    for (uint32_t i = 0; i < g_tune_n; i++) {
+        uint16_t r = tune_rec()[i];
+        uint32_t b = r >> 1;
+        if (b >= nb) continue;
+        tries[b]++;
+        if (r & 1) { succ[b]++; okn++; }
+    }
+    printf("tune: base %lu +-%lu step %lu | %lu attempts logged, %lu boots\n",
+           (unsigned long)g_tune_base, (unsigned long)g_tune_half, (unsigned long)g_tune_step,
+           (unsigned long)g_tune_n, (unsigned long)okn);
+    /* histogram: 20 groups */
+    uint32_t grp = (nb + 19) / 20;
+    for (uint32_t g = 0; g * grp < nb; g++) {
+        uint32_t s = 0, t = 0;
+        for (uint32_t b = g * grp; b < (g + 1) * grp && b < nb; b++) { s += succ[b]; t += tries[b]; }
+        printf("  %8lu..%-8lu %3lu/%-3lu ", (unsigned long)tune_val(g * grp),
+               (unsigned long)tune_val((g + 1) * grp - 1 < nb ? (g + 1) * grp - 1 : nb - 1),
+               (unsigned long)s, (unsigned long)t);
+        for (uint32_t k = 0; k < s && k < 40; k++) putchar('#');
+        putchar('\n');
+    }
+    uint32_t cb, lb, hb;
+    uint32_t used = tune_analyze(succ, nb, &cb, &lb, &hb);
+    if (used < 8) {
+        printf("need at least 8 boots to centre (have %lu). keep power-cycling.\n", (unsigned long)used);
+        return;
+    }
+    uint32_t cv = tune_val(cb);
+    printf("window %lu..%lu (width %lu cycles) -> centre %lu (current saved %lu)\n",
+           (unsigned long)tune_val(lb), (unsigned long)tune_val(hb),
+           (unsigned long)((hb - lb) * g_tune_step), (unsigned long)cv, (unsigned long)g_tune_base);
+    if (apply) {
+        g_cfg.profiles[g_cfg.active].t[TUNE_IDX] = cv;
+        tune_stop();
+        config_save();
+        printf("centre applied and saved; tune mode OFF.\n");
+    } else {
+        printf("'tunecenter' applies it. 'tunestop' leaves tune mode without changing anything.\n");
+    }
+}
+
 /* ---- Status LED --------------------------------------------------------- */
 #if USE_WS2812
 static PIO  led_pio = pio1;
@@ -333,6 +512,12 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
 {
     if (sweep_active)
         g_cfg.profiles[g_cfg.active].t[sweep_idx] = sweep_val;
+    else if (g_tune_active) {
+        g_rng ^= g_rng << 13; g_rng ^= g_rng >> 17; g_rng ^= g_rng << 5;
+        g_rng += (uint32_t)time_us_32();
+        g_tune_b = (g_rng >> 8) % tune_nb();
+        g_cfg.profiles[g_cfg.active].t[TUNE_IDX] = tune_val(g_tune_b);
+    }
 
     const uint32_t *t = g_cfg.profiles[g_cfg.active].t;
 
@@ -428,6 +613,7 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
             judged = true;
             g_last_edges = edges;
             hh->e15 = edges;
+            if (g_tune_active) tune_post(g_tune_b, edges >= g_boot_edges);
             if (edges >= g_boot_edges) {
                 booted = true;
                 led_green_hold();          /* boot confirmed: solid green 5s */
@@ -439,7 +625,7 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
     }
     hh->ms = (uint32_t)(absolute_time_diff_us(t0, get_absolute_time()) / 1000);
     hh->done = 1;
-    if (!judged) { g_last_edges = edges; hh->e15 = edges; }   /* reset dropped before 1.5s: a miss */
+    if (!judged) { g_last_edges = edges; hh->e15 = edges; if (g_tune_active) tune_post(g_tune_b, false); }   /* reset dropped before 1.5s: a miss */
     if (!booted && !red_done) led_red_for(1000);
 
     if (sweep_active) {
@@ -531,6 +717,9 @@ static void print_status(void)
     printf("active profile: %s   attempts since boot: %lu\n",
            g_cfg.profiles[g_cfg.active].name, (unsigned long)g_attempts);
     print_profile(g_cfg.active);
+    if (g_tune_active)
+        printf("*** TUNE MODE ON: t[2] randomised %lu +-%lu, %lu attempts logged. 'tunelog' / 'tunecenter' / 'tunestop' ***\n",
+               (unsigned long)g_tune_base, (unsigned long)g_tune_half, (unsigned long)g_tune_n);
 }
 
 static void print_list(void)
@@ -556,6 +745,8 @@ static void print_help(void)
         "  defaults             restore built-in defaults (not saved yet)\n"
         "  opt [name 0|1]       diagnostic options: driven, postpull, rstpull\n"
         "  rstpull [0|1]        RGH1.2 reset 1-cycle pull-up (diagnostic, default 0=safe)\n"
+        "  tune [half] [step]   start auto-centring (default +-600 step 5), then run console unplugged\n"
+        "  tunelog / tunecenter / tunestop   show results / apply centre / leave tune mode\n"
         "  hist                 last 16 attempts: POST edges + how long reset stayed high\n"
         "  last                 POST edges counted after the last glitch\n"
         "  bootedges [n]        POST edges needed to count as a real boot (default 6)\n"
@@ -619,6 +810,7 @@ static void handle_line(char *line)
         g_cfg.profiles[g_cfg.active].name[PROFILE_NAME_LEN - 1] = '\0';
         printf("renamed -> %s (unsaved)\n", g_cfg.profiles[g_cfg.active].name);
     } else if (!strcmp(cmd, "save")) {
+        if (g_tune_active) { printf("err: tune mode is on (t[2] is being randomised). 'tunecenter' or 'tunestop' first.\n"); return; }
         config_save();
         printf("saved to flash.\n");
     } else if (!strcmp(cmd, "load")) {
@@ -715,6 +907,27 @@ static void handle_line(char *line)
         printf("sweeping %s from %lu to %lu step %ld\n", tname(g_cfg.profiles[g_cfg.active].method, idx),
                (unsigned long)s, (unsigned long)e, (long)st);
         printf("power-cycle the console; it steps each miss until it boots.\n");
+    } else if (!strcmp(cmd, "tune")) {
+        char *a = strtok(NULL, " \t");
+        char *b = strtok(NULL, " \t");
+        uint32_t half = a ? (uint32_t)strtoul(a, NULL, 0) : 600;
+        uint32_t step = b ? (uint32_t)strtoul(b, NULL, 0) : 5;
+        uint32_t base = g_cfg.profiles[g_cfg.active].t[TUNE_IDX];
+        if (step == 0 || half < step || half / step > 300 || half > 5000 || base < half) {
+            printf("err: tune [half<=5000] [step]  (half/step <= 300)\n"); return;
+        }
+        if (g_cfg.profiles[g_cfg.active].method != METHOD_RGH12) { printf("err: tune is RGH1.2 only\n"); return; }
+        tune_start(base, half, step);
+        printf("TUNE MODE ON: delay_to_rst %lu +-%lu step %lu. Old log erased.\n",
+               (unsigned long)base, (unsigned long)half, (unsigned long)step);
+        printf("Unplug USB, power-cycle the console ~20 boots, then plug USB (console OFF) and run 'tunelog'.\n");
+    } else if (!strcmp(cmd, "tunelog")) {
+        tune_report(false);
+    } else if (!strcmp(cmd, "tunecenter")) {
+        tune_report(true);
+    } else if (!strcmp(cmd, "tunestop")) {
+        tune_stop();
+        printf("tune mode OFF, saved profile untouched.\n");
     } else if (!strcmp(cmd, "sweepstop")) {
         sweep_active = false;
         printf("sweep stopped at %s=%lu ('save' to keep).\n",
@@ -770,6 +983,7 @@ int main(void)
      * docs/SAFETY.md; on phat it is below the Pico's threshold.) */
     gpio_set_input_enabled(POST_PIN, true);
     config_load();
+    tune_load();
     /* DIAG: option bit2 = POST pull-down (reset default of the RP2040 pad). */
     gpio_set_pulls(POST_PIN, false, (g_cfg.reserved & 4u) != 0);
 
@@ -783,6 +997,7 @@ int main(void)
     uint32_t last_tick = 0;
     while (true) {
         console_task();
+        tune_service();
         if (sweep_active && sweep_tick != last_tick) {
             last_tick = sweep_tick;
             printf("  sweep: %s = %lu\n", tname(g_cfg.profiles[g_cfg.active].method, sweep_idx),
