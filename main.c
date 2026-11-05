@@ -76,7 +76,7 @@
 #ifndef MP_SYS_CLK_KHZ
 #define MP_SYS_CLK_KHZ 192000   /* multiple of 12/48 MHz; 4 cycles per STBY_CLK */
 #endif
-#ifdef MP_T_SIDE
+#ifndef MP_T_SET
 #define MP_DRV_PROG        glitch_side_program
 #define MP_DRV_CFG(o)      glitch_side_program_get_default_config(o)
 #define MP_DRV_WIDTH(w)    (w)
@@ -189,6 +189,9 @@ static const uint8_t *g_flash_cfg = (const uint8_t *)(XIP_BASE + FLASH_TARGET_OF
 
 /* Shared glitch counter so the console can report activity. */
 static volatile uint32_t g_attempts = 0;
+typedef struct { uint32_t e15, etot, ms; uint8_t done; absolute_time_t t0; } hist_t;
+static hist_t g_hist[16];
+static volatile uint32_t g_hist_n = 0;       /* attempts started since boot */
 static volatile uint32_t g_last_edges = 0;   /* POST edges seen 1.5s after the last glitch */
 static volatile uint32_t g_boot_edges = 6;   /* edges needed to call it a real boot */
 
@@ -348,7 +351,7 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
           : pullup ? glitch_pu_program_get_default_config(offset)
                    : glitch_program_get_default_config(offset));
     sm_config_set_set_pins(&c, CPU_RESET, 2);   /* bit0 = RESET, bit1 = PLL/EXTC */
-#ifdef MP_T_SIDE
+#ifndef MP_T_SET
     if (driven) sm_config_set_sideset_pins(&c, CPU_RESET);
 #endif
 
@@ -409,6 +412,9 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
      * count POST edges for 1.5s after the glitch and require g_boot_edges of
      * them. The count is exposed via the 'last' command for calibration. */
     absolute_time_t t0 = get_absolute_time();
+    hist_t *hh = &g_hist[g_hist_n % 16];
+    hh->e15 = 0; hh->etot = 0; hh->ms = 0; hh->done = 0; hh->t0 = t0;
+    g_hist_n++;
     bool judged = false;
     bool booted = false;
     bool red_done = false;
@@ -416,11 +422,12 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
     bool lastp = gpio_get(POST_PIN);
     while (gpio_get(arm_pin)) {
         bool p = gpio_get(POST_PIN);
-        if (p != lastp) { edges++; lastp = p; }
+        if (p != lastp) { edges++; lastp = p; hh->etot = edges; }
         led_tick();
         if (!judged && absolute_time_diff_us(t0, get_absolute_time()) > 1500000) {
             judged = true;
             g_last_edges = edges;
+            hh->e15 = edges;
             if (edges >= g_boot_edges) {
                 booted = true;
                 led_green_hold();          /* boot confirmed: solid green 5s */
@@ -430,7 +437,9 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
             }
         }
     }
-    if (!judged) g_last_edges = edges;   /* reset dropped before 1.5s: a miss */
+    hh->ms = (uint32_t)(absolute_time_diff_us(t0, get_absolute_time()) / 1000);
+    hh->done = 1;
+    if (!judged) { g_last_edges = edges; hh->e15 = edges; }   /* reset dropped before 1.5s: a miss */
     if (!booted && !red_done) led_red_for(1000);
 
     if (sweep_active) {
@@ -547,6 +556,7 @@ static void print_help(void)
         "  defaults             restore built-in defaults (not saved yet)\n"
         "  opt [name 0|1]       diagnostic options: driven, postpull, rstpull\n"
         "  rstpull [0|1]        RGH1.2 reset 1-cycle pull-up (diagnostic, default 0=safe)\n"
+        "  hist                 last 16 attempts: POST edges + how long reset stayed high\n"
         "  last                 POST edges counted after the last glitch\n"
         "  bootedges [n]        POST edges needed to count as a real boot (default 6)\n"
         "  attempts             reset the attempt counter\n"
@@ -642,6 +652,18 @@ static void handle_line(char *line)
                "  clock    = %u kHz\n",
                (unsigned)!!(g_cfg.reserved & 2u), (unsigned)!!(g_cfg.reserved & 4u),
                (unsigned)!!(g_cfg.reserved & 1u), (unsigned)MP_SYS_CLK_KHZ);
+    } else if (!strcmp(cmd, "hist")) {
+        uint32_t n = g_hist_n, from = n > 16 ? n - 16 : 0;
+        printf("attempt  POST-edges@1.5s  total-edges  reset-high-time\n");
+        for (uint32_t k = from; k < n; k++) {
+            hist_t *h = &g_hist[k % 16];
+            uint32_t ms = h->done ? h->ms
+                : (uint32_t)(absolute_time_diff_us(h->t0, get_absolute_time()) / 1000);
+            printf("#%-7lu %-16lu %-12lu %lu ms%s\n", (unsigned long)(k + 1),
+                   (unsigned long)h->e15, (unsigned long)h->etot, (unsigned long)ms,
+                   h->done ? "" : "  (still high = running/booted)");
+        }
+        if (n == 0) printf("no attempts yet\n");
     } else if (!strcmp(cmd, "last")) {
         printf("POST edges seen after the last glitch: %lu  (boot needs >= %lu)\n",
                (unsigned long)g_last_edges, (unsigned long)g_boot_edges);
