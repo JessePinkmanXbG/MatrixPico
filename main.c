@@ -192,8 +192,8 @@ static volatile uint32_t g_attempts = 0;
 typedef struct { uint32_t e15, etot, ms; uint8_t done; absolute_time_t t0; } hist_t;
 static hist_t g_hist[16];
 static volatile uint32_t g_hist_n = 0;       /* attempts started since boot */
-static volatile uint32_t g_last_edges = 0;   /* POST edges seen 1.5s after the last glitch */
-static volatile uint32_t g_boot_edges = 6;   /* edges needed to call it a real boot */
+static volatile uint32_t g_last_edges = 0;   /* POST edges seen 4s after the last glitch */
+static volatile uint32_t g_boot_edges = 3;   /* edges needed to call it a real boot */
 
 /* Sweep (auto-tune) state, shared core0 <-> core1. When active, core1 applies
  * sweep_val to the active profile's timing[sweep_idx] on each attempt and steps
@@ -409,7 +409,7 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
 
     /* A hung (failed) glitch also leaves reset high for seconds, so reset-high
      * alone is NOT proof of a boot. A real boot keeps changing POST codes, so we
-     * count POST edges for 1.5s after the glitch and require g_boot_edges of
+     * count POST edges for 4s after the glitch and require g_boot_edges of
      * them. The count is exposed via the 'last' command for calibration. */
     absolute_time_t t0 = get_absolute_time();
     hist_t *hh = &g_hist[g_hist_n % 16];
@@ -424,7 +424,7 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
         bool p = gpio_get(POST_PIN);
         if (p != lastp) { edges++; lastp = p; hh->etot = edges; }
         led_tick();
-        if (!judged && absolute_time_diff_us(t0, get_absolute_time()) > 1500000) {
+        if (!judged && absolute_time_diff_us(t0, get_absolute_time()) > 4000000) {
             judged = true;
             g_last_edges = edges;
             hh->e15 = edges;
@@ -439,7 +439,7 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
     }
     hh->ms = (uint32_t)(absolute_time_diff_us(t0, get_absolute_time()) / 1000);
     hh->done = 1;
-    if (!judged) { g_last_edges = edges; hh->e15 = edges; }   /* reset dropped before 1.5s: a miss */
+    if (!judged) { g_last_edges = edges; hh->e15 = edges; }   /* reset dropped before 4s: a miss */
     if (!booted && !red_done) led_red_for(1000);
 
     if (sweep_active) {
@@ -558,7 +558,7 @@ static void print_help(void)
         "  rstpull [0|1]        RGH1.2 reset 1-cycle pull-up (diagnostic, default 0=safe)\n"
         "  hist                 last 16 attempts: POST edges + how long reset stayed high\n"
         "  last                 POST edges counted after the last glitch\n"
-        "  bootedges [n]        POST edges needed to count as a real boot (default 6)\n"
+        "  bootedges [n]        POST edges needed to count as a real boot (default 3)\n"
         "  attempts             reset the attempt counter\n"
         "  mon                  watch CPU_RESET/POST live for 6s (power-cycle to test)\n"
         "  sweep <i> <a> <b> [s] auto-step timing i from a to b until it boots\n"
@@ -654,7 +654,7 @@ static void handle_line(char *line)
                (unsigned)!!(g_cfg.reserved & 1u), (unsigned)MP_SYS_CLK_KHZ);
     } else if (!strcmp(cmd, "hist")) {
         uint32_t n = g_hist_n, from = n > 16 ? n - 16 : 0;
-        printf("attempt  POST-edges@1.5s  total-edges  reset-high-time\n");
+        printf("attempt  POST-edges@4s    total-edges  reset-high-time\n");
         for (uint32_t k = from; k < n; k++) {
             hist_t *h = &g_hist[k % 16];
             uint32_t ms = h->done ? h->ms
