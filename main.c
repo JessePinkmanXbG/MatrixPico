@@ -168,6 +168,8 @@ static const uint8_t *g_flash_cfg = (const uint8_t *)(XIP_BASE + FLASH_TARGET_OF
 
 /* Shared glitch counter so the console can report activity. */
 static volatile uint32_t g_attempts = 0;
+static volatile uint32_t g_last_edges = 0;   /* POST edges seen 1.5s after the last glitch */
+static volatile uint32_t g_boot_edges = 6;   /* edges needed to call it a real boot */
 
 /* Sweep (auto-tune) state, shared core0 <-> core1. When active, core1 applies
  * sweep_val to the active profile's timing[sweep_idx] on each attempt and steps
@@ -315,30 +317,39 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
     gpio_init(arm_pin);
     gpio_set_dir(arm_pin, GPIO_IN);
 
-    /* If the reset-sense line stays high, the console booted: flash green
-     * briefly, then go dark. If it drops quickly, the glitch missed and we
-     * loop round for another attempt. */
+    /* A hung (failed) glitch also leaves reset high for seconds, so reset-high
+     * alone is NOT proof of a boot. A real boot keeps changing POST codes, so we
+     * count POST edges for 1.5s after the glitch and require g_boot_edges of
+     * them. The count is exposed via the 'last' command for calibration. */
     absolute_time_t t0 = get_absolute_time();
-    bool shown = false;
+    bool judged = false;
     bool booted = false;
+    uint32_t edges = 0;
+    bool lastp = gpio_get(POST_PIN);
     while (gpio_get(arm_pin)) {
-        if (!shown && absolute_time_diff_us(t0, get_absolute_time()) > 1500000) {
-            booted = true;
-            /* boot confirmed: flash blue 2.5s, then solid green 5s, then off */
-            absolute_time_t s0 = get_absolute_time();
-            while (absolute_time_diff_us(s0, get_absolute_time()) < 2500000) {
-                led_blue();
-                sleep_ms(100);
+        bool p = gpio_get(POST_PIN);
+        if (p != lastp) { edges++; lastp = p; }
+        if (!judged && absolute_time_diff_us(t0, get_absolute_time()) > 1500000) {
+            judged = true;
+            g_last_edges = edges;
+            if (edges >= g_boot_edges) {
+                booted = true;
+                /* boot confirmed: flash blue 2.5s, then solid green 5s, then off */
+                absolute_time_t s0 = get_absolute_time();
+                while (absolute_time_diff_us(s0, get_absolute_time()) < 2500000) {
+                    led_blue();
+                    sleep_ms(100);
+                    led_off();
+                    sleep_ms(100);
+                }
+                led_green();
+                sleep_ms(5000);
                 led_off();
-                sleep_ms(100);
             }
-            led_green();
-            sleep_ms(5000);
-            led_off();
-            shown = true;
         }
         tight_loop_contents();
     }
+    if (!judged) g_last_edges = edges;   /* reset dropped before 1.5s: a miss */
     led_off();
 
     if (sweep_active) {
@@ -451,6 +462,8 @@ static void print_help(void)
         "  load                 reload profiles from flash (discard edits)\n"
         "  defaults             restore built-in defaults (not saved yet)\n"
         "  rstpull [0|1]        RGH1.2 reset 1-cycle pull-up (diagnostic, default 0=safe)\n"
+        "  last                 POST edges counted after the last glitch\n"
+        "  bootedges [n]        POST edges needed to count as a real boot (default 6)\n"
         "  attempts             reset the attempt counter\n"
         "  mon                  watch CPU_RESET/POST live for 6s (power-cycle to test)\n"
         "  sweep <i> <a> <b> [s] auto-step timing i from a to b until it boots\n"
@@ -528,6 +541,13 @@ static void handle_line(char *line)
         printf("rstpull = %u  (%s; 'save' to persist)\n", (unsigned)(g_cfg.reserved & 1u),
                (g_cfg.reserved & 1u) ? "1-cycle 3.3V pull-up ON - bench diagnostic only"
                                       : "pure open-drain, safe default");
+    } else if (!strcmp(cmd, "last")) {
+        printf("POST edges seen after the last glitch: %lu  (boot needs >= %lu)\n",
+               (unsigned long)g_last_edges, (unsigned long)g_boot_edges);
+    } else if (!strcmp(cmd, "bootedges")) {
+        char *a = strtok(NULL, " \t");
+        if (a) g_boot_edges = (uint32_t)strtoul(a, NULL, 0);
+        printf("bootedges = %lu\n", (unsigned long)g_boot_edges);
     } else if (!strcmp(cmd, "attempts")) {
         g_attempts = 0;
         printf("attempt counter reset.\n");
