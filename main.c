@@ -73,13 +73,19 @@
 #define METHOD_RGH12   0   /* Trinity/Corona/Falcon/Jasper - PLL bypass */
 #define METHOD_EXTCLK  1   /* Xenon/Zephyr - EXT_CLK_EN slowdown */
 
+#ifndef MP_SYS_CLK_KHZ
 #define MP_SYS_CLK_KHZ 192000   /* multiple of 12/48 MHz; 4 cycles per STBY_CLK */
+#endif
+#ifndef MP_RST_DRIVEN
+#define MP_RST_DRIVEN 0          /* TEST BUILDS ONLY: 1 = original PicoRGH push-pull reset drive */
+#endif
 
 /* ---- Profiles ----------------------------------------------------------- */
 #define NUM_TIMINGS     5
 #define NUM_PROFILES    6
 #define PROFILE_NAME_LEN 16
-#define CONFIG_MAGIC    0x4D505836u   /* "MPX6" - bump if layout/clock changes */
+/* Test variants get their own magic so they never load each other's saved timings. */
+#define CONFIG_MAGIC    (0x4D505836u ^ ((MP_SYS_CLK_KHZ == 200000) ? 0x100u : 0u) ^ (MP_RST_DRIVEN ? 0x200u : 0u))
 #define CONFIG_MAGIC_V5 0x4D505835u   /* "MPX5" - 5-profile layout, migrated on load */
 #define NUM_PROFILES_V5 5
 #define CONFIG_VERSION  1
@@ -136,6 +142,12 @@ _Static_assert(sizeof(config_t) <= 256, "config must fit one flash page");
  * with the Trinity values only so the firmware has something to run; they are
  * NOT verified for those boards and MUST be dialed in before they are trusted.
  */
+#if MP_SYS_CLK_KHZ == 200000
+#define TRI_T { 3, 108786906, 7288000, 47, 50000 }    /* proven 200 MHz values */
+#else
+#define TRI_T { 3, 104435430, 6996480, 45, 48000 }    /* same real-time at 192 MHz */
+#endif
+
 static const config_t DEFAULT_CONFIG = {
     .magic   = CONFIG_MAGIC,
     .version = CONFIG_VERSION,
@@ -144,10 +156,10 @@ static const config_t DEFAULT_CONFIG = {
     .profiles = {
         /* RGH 1.2, 192 MHz values (200 MHz x 0.96, same real-time timing).
          * trinity carries balika011's proven numbers; others are seeds. */
-        { "trinity", METHOD_RGH12,  { 3, 104435430, 6996480, 45, 48000 } },
-        { "corona",  METHOD_RGH12,  { 3, 104435430, 6996480, 45, 48000 } },  /* dial in */
-        { "jasper",  METHOD_RGH12,  { 3, 104435430, 6996480, 45, 48000 } },  /* dial in */
-        { "falcon",  METHOD_RGH12,  { 3, 104435430, 6996480, 45, 48000 } },  /* dial in */
+        { "trinity", METHOD_RGH12,  TRI_T },
+        { "corona",  METHOD_RGH12,  TRI_T },  /* dial in */
+        { "jasper",  METHOD_RGH12,  TRI_T },  /* dial in */
+        { "falcon",  METHOD_RGH12,  TRI_T },  /* dial in */
         /* EXT_CLK seeds from Octal450's Zephyr VHDL @192MHz: r_end 118008,
          * pulse 2, slow_delay ~382ms (73,344,000 cyc), T_BUF 50000, ~12 pulses.
          * These are STRUCTURAL SEEDS - must be dialed in on hardware. */
@@ -192,7 +204,8 @@ static void config_load(void)
     if (fc->magic == CONFIG_MAGIC && fc->version == CONFIG_VERSION &&
         fc->active < NUM_PROFILES) {
         memcpy(&g_cfg, fc, sizeof(config_t));
-    } else if (fc->magic == CONFIG_MAGIC_V5 && fc->version == CONFIG_VERSION &&
+    } else if (MP_SYS_CLK_KHZ == 192000 && !MP_RST_DRIVEN &&
+               fc->magic == CONFIG_MAGIC_V5 && fc->version == CONFIG_VERSION &&
                fc->active < NUM_PROFILES_V5) {
         /* Old 5-profile save: keep the user's tuned profiles, add the new ones. */
         memcpy(&g_cfg, &DEFAULT_CONFIG, sizeof(config_t));
@@ -300,10 +313,11 @@ static void led_green_hold(void)               /* confirmed boot: solid green 5s
 
 static const pio_program_t *eng_prog(int e)
 {
-    return (e == 1) ? &extclk_program : (e == 2) ? &glitch_pu_program : &glitch_program;
+    return (e == 1) ? &extclk_program : (e == 2) ? &glitch_pu_program
+         : (e == 3) ? &glitch_drv_program : &glitch_program;
 }
 
-static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pullup)
+static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pullup, bool driven)
 {
     if (sweep_active)
         g_cfg.profiles[g_cfg.active].t[sweep_idx] = sweep_val;
@@ -321,8 +335,9 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
 
     pio_sm_config c = (method == METHOD_EXTCLK)
         ? extclk_program_get_default_config(offset)
-        : (pullup ? glitch_pu_program_get_default_config(offset)
-                  : glitch_program_get_default_config(offset));
+        : (driven ? glitch_drv_program_get_default_config(offset)
+          : pullup ? glitch_pu_program_get_default_config(offset)
+                   : glitch_program_get_default_config(offset));
     sm_config_set_set_pins(&c, CPU_RESET, 2);   /* bit0 = RESET, bit1 = PLL/EXTC */
 
     pio_gpio_init(pio, CPU_RESET);
@@ -337,15 +352,27 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
     /* Both latches low. PLL is an output; RESET starts as an INPUT (floating)
      * so we never hold the 1.1V reset line at 3.3V. glitch.pio only switches
      * RESET to output for the pulse plus one pull-up cycle. */
-    pio_sm_set_pins_with_mask(pio, sm, 0u,
-                              (1u << CPU_RESET) | (1u << PLL_BYPASS));
-    pio_sm_set_pindirs_with_mask(pio, sm, (1u << PLL_BYPASS),
-                                 (1u << CPU_RESET) | (1u << PLL_BYPASS));
+    if (driven) {
+        /* TEST BUILD: original PicoRGH behaviour, reset driven HIGH for the window. */
+        pio_sm_set_pins_with_mask(pio, sm, (1u << CPU_RESET),
+                                  (1u << CPU_RESET) | (1u << PLL_BYPASS));
+        pio_sm_set_pindirs_with_mask(pio, sm, (1u << CPU_RESET) | (1u << PLL_BYPASS),
+                                     (1u << CPU_RESET) | (1u << PLL_BYPASS));
+    } else {
+        pio_sm_set_pins_with_mask(pio, sm, 0u,
+                                  (1u << CPU_RESET) | (1u << PLL_BYPASS));
+        pio_sm_set_pindirs_with_mask(pio, sm, (1u << PLL_BYPASS),
+                                     (1u << CPU_RESET) | (1u << PLL_BYPASS));
+    }
 
     pio_sm_init(pio, sm, offset, &c);
     pio_sm_set_enabled(pio, sm, true);
 
     led_flicker_start();      /* 2.5s fast blue flicker, non-blocking */
+    /* The proven build waited ~200ms here before sending the timing values; keep
+     * that so POST counting starts at exactly the same moment. */
+    { absolute_time_t dl = delayed_by_ms(get_absolute_time(), 204);
+      while (absolute_time_diff_us(get_absolute_time(), dl) > 0) led_tick(); }
 
     /* Same 5-value feed for both engines (slots mean different things per
      * method). Reset-low lasts (y + 1) cycles, so pass width-1. */
@@ -441,7 +468,8 @@ static void core1_main(void)
          *   0 = RGH1.2 open-drain, 1 = EXT_CLK, 2 = RGH1.2 + 1-cycle pull-up (rstpull 1). */
         uint m = g_cfg.profiles[g_cfg.active].method;
         bool pullup = (m != METHOD_EXTCLK) && (g_cfg.reserved & 1u);
-        int eng = (m == METHOD_EXTCLK) ? 1 : (pullup ? 2 : 0);
+        bool driven = (m != METHOD_EXTCLK) && MP_RST_DRIVEN;
+        int eng = (m == METHOD_EXTCLK) ? 1 : (driven ? 3 : (pullup ? 2 : 0));
         if (eng != loaded) {
             if (loaded >= 0) {
                 pio_sm_set_enabled(pio, sm, false);
@@ -450,7 +478,7 @@ static void core1_main(void)
             offset = pio_add_program(pio, eng_prog(eng));
             loaded = eng;
         }
-        run_glitch_once(pio, sm, offset, m, pullup);
+        run_glitch_once(pio, sm, offset, m, pullup, driven);
     }
 }
 

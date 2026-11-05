@@ -114,3 +114,51 @@ hold_pll:
 
 	set pins, 0b00              ; PLL bypass LOW
 	push block                  ; tell the C side we're done
+
+
+; ---------------------------------------------------------------------------
+; TEST-ONLY variant (MP_RST_DRIVEN=1): the original PicoRGH behaviour with the
+; reset line DRIVEN push-pull (high during the window, low for the glitch).
+; Used only to find out whether the console needs a driven reset edge. Not the
+; release engine.
+; ---------------------------------------------------------------------------
+.program glitch_drv
+
+	pull block
+	mov x, osr
+	pull block
+	mov y, osr
+
+wait_for_post_loop:
+	wait 1 gpio 28
+	wait 0 gpio 28
+	jmp x-- wait_for_post_loop
+
+delay_pll:
+	jmp y-- delay_pll
+
+	set pins, 0b11              ; PLL bypass HIGH, reset stays driven high
+
+	pull block
+	mov x, osr
+	pull block
+	mov y, osr
+
+	wait 1 gpio 28
+
+delay_rst:
+	jmp x-- delay_rst
+
+	set pins, 0b10              ; reset LOW (the glitch), PLL high
+hold_rst:
+	jmp y-- hold_rst
+
+	set pins, 0b11              ; reset driven high again
+
+	pull block
+	mov x, osr
+hold_pll:
+	jmp x-- hold_pll
+
+	set pins, 0b01              ; PLL low, reset high
+	push block
