@@ -247,12 +247,14 @@ static inline void led_off(void)   { led_raw(0); }
 static inline void led_blue(void)  { led_raw(led_rgb(0, 0, 24)); }
 static inline void led_green(void) { led_raw(led_rgb(0, 24, 0)); }
 static inline void led_red(void)   { led_raw(led_rgb(24, 0, 0)); }
+static inline void led_dim_green(void) { led_raw(led_rgb(0, 3, 0)); }   /* low-brightness 'running' light */
 #else
 static void led_init(void) { gpio_init(LED_PIN); gpio_set_dir(LED_PIN, GPIO_OUT); }
 static inline void led_off(void)   { gpio_put(LED_PIN, 0); }
 static inline void led_blue(void)  { gpio_put(LED_PIN, 1); }
 static inline void led_green(void) { gpio_put(LED_PIN, 1); }
 static inline void led_red(void)   { gpio_put(LED_PIN, 1); }
+static inline void led_dim_green(void) { gpio_put(LED_PIN, 1); }
 #endif
 
 /* ---- Glitch core (core1) ------------------------------------------------ */
@@ -262,7 +264,8 @@ static inline void led_red(void)   { gpio_put(LED_PIN, 1); }
  * confirmed boot; red for 1s on a failed attempt. Everything is non-blocking
  * (except the green hold) so a red/blue phase never delays arming the next try. */
 #define GREEN_GAP_MS 500   /* dark gap between the blue flicker and the green */
-static int g_led_cur = -1;                       /* 0 off, 1 blue, 2 red, 3 green */
+static int g_led_cur = -1;                       /* 0 off, 1 blue, 2 red, 3 green, 4 dim green */
+static bool g_dim_green = false;                 /* after a boot: stay on, dimmed */
 static absolute_time_t g_flick_t0, g_flick_end, g_red_end;   /* zero-init = nil_time */
 
 static void led_set(int c)
@@ -273,6 +276,7 @@ static void led_set(int c)
     case 1:  led_blue();  break;
     case 2:  led_red();   break;
     case 3:  led_green(); break;
+    case 4:  led_dim_green(); break;
     default: led_off();   break;
     }
 }
@@ -286,11 +290,12 @@ static void led_tick(void)
         led_set(((el / 17000) & 1) == 0 ? 1 : 0);
         return;
     }
-    led_set(0);
+    led_set(g_dim_green ? 4 : 0);
 }
 
 static void led_flicker_start(void)
 {
+    g_dim_green = false;
     g_flick_t0 = get_absolute_time();
     g_flick_end = delayed_by_ms(g_flick_t0, 2500);
 }
@@ -301,13 +306,14 @@ static void led_red_for(uint ms)
     led_tick();
 }
 
-static void led_green_hold(void)               /* confirmed boot: solid green 5s */
+static void led_green_hold(void)               /* confirmed boot: green 5s, then dim green */
 {
     g_red_end = nil_time;
     g_flick_end = nil_time;
     led_set(3);
     sleep_ms(5000);
-    led_set(0);
+    g_dim_green = true;           /* then stay on, dimmed, while the console runs */
+    led_set(4);
 }
 
 
