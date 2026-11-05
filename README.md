@@ -26,7 +26,7 @@ Matrix Pico tool, pick your console, and press **FLASH PICO**. The tool copies
 the bundled firmware onto the Pico, waits for it to restart, then selects and
 saves that console's profile. No drag-and-drop. A Pico already running Matrix
 Pico firmware is rebooted into update mode automatically (no button press).
-Run from source? Put a built `MatrixPico.uf2` in `tools/assets/`.
+Run from source? Put the board files in `tools/assets/firmware/` (copy `firmware/*.uf2`).
 
 ## Wiring (RGH 1.2)
 
@@ -157,6 +157,9 @@ keep it open and keep the credits.
 
 ### Firmware shipped inside the tool
 
-The tool bundles `firmware/MatrixPico.uf2` - the exact binary that was tested on
-a console - rather than recompiling it in CI. When the firmware changes, rebuild
-it, test it on hardware, and replace that file.
+Each board has its **own** firmware file in `firmware/` (`trinity.uf2`, later
+`corona.uf2`, ...). The tool flashes the file for the console you picked, and
+only boards with a hardware-tested file can be flashed. Files are never
+recompiled in CI: build one, test it on that console, then drop it into
+`firmware/<board>.uf2`. A board's binary is frozen once shipped, so work on
+one board can never change another's.

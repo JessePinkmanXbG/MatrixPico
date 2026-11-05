@@ -23,20 +23,21 @@ jobs:
         with:
           python-version: '3.12'
 
-      # Bundle the exact firmware binary that was hardware-tested (firmware/MatrixPico.uf2),
+      # Bundle the exact per-board firmware binaries that were hardware-tested (firmware/<board>.uf2),
       # NOT a fresh CI compile: a different toolchain produced different code and
       # different boot behaviour on the console.
       - name: Use the hardware-validated firmware
         shell: bash
         run: |
-          cp firmware/MatrixPico.uf2 tools/assets/MatrixPico.uf2
-          ls -l tools/assets/MatrixPico.uf2
+          mkdir -p tools/assets/firmware
+          cp firmware/*.uf2 tools/assets/firmware/
+          ls -l tools/assets/firmware
 
       - name: Install deps
         run: pip install pyserial pillow pyinstaller
 
       - name: Build exe
-        run: pyinstaller --onefile --windowed --name MatrixPicoConsole --paths tools --add-data "tools/assets/bg.png;assets" --add-data "tools/assets/Inter-ExtraBoldItalic.otf;assets" --add-data "tools/assets/MatrixPico.uf2;assets" tools/matrixpico_console.py
+        run: pyinstaller --onefile --windowed --name MatrixPicoConsole --paths tools --add-data "tools/assets/bg.png;assets" --add-data "tools/assets/Inter-ExtraBoldItalic.otf;assets" --add-data "tools/assets/firmware;assets/firmware" tools/matrixpico_console.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
