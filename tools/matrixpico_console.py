@@ -20,6 +20,8 @@ import serial
 import serial.tools.list_ports
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageTk
 
+import picoflash
+
 RP2040_VID = 0x2E8A
 WIN_W, WIN_H = 900, 720
 
@@ -185,6 +187,9 @@ class App:
         self.rxq = queue.Queue()
         self.devices = []
         self.console_btns = {}
+        self.selected = None
+        self.flashq = queue.Queue()
+        self.flash_busy = False
 
         self.canvas = tk.Canvas(root, width=WIN_W, height=WIN_H, highlightthickness=0, bd=0)
         self.canvas.place(x=0, y=0)
@@ -197,6 +202,7 @@ class App:
         self._style()
         self._build_connection()
         self._build_consoles()
+        self._build_flash()
         self._build_debug()
 
         self.refresh_ports(auto_connect=True)
@@ -249,12 +255,70 @@ class App:
                                                  fill=CYAN, font=("Consolas", 10, "bold"))
 
     def pick_console(self, name):
+        self.selected = name
         self.send("use " + name)
         self.send("status")
         for n, b in self.console_btns.items():
             b.set_active(n == name)
         self.canvas.itemconfigure(self.engine_id,
                                   text="engine: " + ("EXT_CLK" if name in ("zephyr", "xenon") else "RGH1.2"))
+
+    # ---- flash a blank Pico --------------------------------------------------
+    def _build_flash(self):
+        self.flash_btn = NeonButton(self.canvas, 36, 596, 218, 38, "FLASH PICO",
+                                    self.flash_pico, big=True)
+        self.flash_id = self.canvas.create_text(
+            36, 646, anchor="nw", width=224, text="pick a console, plug in the Pico, flash",
+            fill=CYAN, font=("Consolas", 9, "bold"))
+
+    def flash_set(self, text, color=CYAN):
+        self.canvas.itemconfigure(self.flash_id, text=text, fill=color)
+
+    def flash_pico(self):
+        if self.flash_busy:
+            return
+        if not self.selected:
+            self.flash_set("pick a console first", "#ff5a5a")
+            return
+        console = self.selected
+        self.flash_busy = True
+        self.flash_set("starting...")
+        self.disconnect()                       # the port goes away while flashing
+        self.log(f"\n--- flashing Pico for {console} ---\n")
+        threading.Thread(target=self._flash_worker, args=(console,), daemon=True).start()
+
+    def _flash_worker(self, console):
+        q = self.flashq
+        try:
+            port = picoflash.flash_pico(
+                console,
+                log=lambda t: q.put(("log", t)),
+                status=lambda t: q.put(("status", t)))
+            q.put(("done", port, console))
+        except picoflash.FlashError as e:
+            q.put(("error", str(e)))
+        except Exception as e:                  # never leave the button stuck
+            q.put(("error", f"unexpected error: {e}"))
+
+    def _flash_events(self):
+        try:
+            while True:
+                ev = self.flashq.get_nowait()
+                if ev[0] == "log":
+                    self.log(ev[1])
+                elif ev[0] == "status":
+                    self.flash_set(ev[1])
+                elif ev[0] == "done":
+                    self.flash_busy = False
+                    self.flash_set(f"Pico successfully flashed ({ev[2]})", "#3cff78")
+                    self.log(f"\n*** Pico successfully flashed - {ev[2]} profile saved ***\n")
+                    self.refresh_ports(auto_connect=True)
+                elif ev[0] == "error":
+                    self.flash_busy = False
+                    self.flash_set(ev[1], "#ff5a5a")
+                    self.log(f"\n[flash failed: {ev[1]}]\n")
+        except queue.Empty:
+            pass
 
     # ---- debug section -------------------------------------------------------
     def _build_debug(self):
@@ -347,6 +411,7 @@ class App:
                 break
 
     def drain(self):
+        self._flash_events()
         try:
             while True:
                 self.log(self.rxq.get_nowait())

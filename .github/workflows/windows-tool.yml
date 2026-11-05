@@ -4,6 +4,9 @@ on:
   push:
     paths:
       - 'tools/**'
+      - '*.c'
+      - '*.pio'
+      - 'CMakeLists.txt'
       - '.github/workflows/windows-tool.yml'
   workflow_dispatch:
 
@@ -11,7 +14,39 @@ permissions:
   contents: write
 
 jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ARM toolchain
+        uses: carlosperate/arm-none-eabi-gcc-action@v1
+        with:
+          release: '13.2.Rel1'
+
+      - name: Checkout Pico SDK
+        uses: actions/checkout@v4
+        with:
+          repository: raspberrypi/pico-sdk
+          ref: 2.1.0
+          path: pico-sdk
+          submodules: true
+
+      - name: Build firmware
+        run: |
+          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+        env:
+          PICO_SDK_PATH: ${{ github.workspace }}/pico-sdk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-uf2
+          path: build/MatrixPico.uf2
+          if-no-files-found: error
+
   build:
+    needs: firmware
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,11 +55,17 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Get firmware to bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: firmware-uf2
+          path: tools/assets
+
       - name: Install deps
         run: pip install pyserial pillow pyinstaller
 
       - name: Build exe
-        run: pyinstaller --onefile --windowed --name MatrixPicoConsole --add-data "tools/assets/bg.png;assets" --add-data "tools/assets/Inter-ExtraBoldItalic.otf;assets" tools/matrixpico_console.py
+        run: pyinstaller --onefile --windowed --name MatrixPicoConsole --paths tools --add-data "tools/assets/bg.png;assets" --add-data "tools/assets/Inter-ExtraBoldItalic.otf;assets" --add-data "tools/assets/MatrixPico.uf2;assets" tools/matrixpico_console.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -33,13 +74,26 @@ jobs:
           path: dist/MatrixPicoConsole.exe
           if-no-files-found: error
 
-      - name: Publish to release
+      # main -> the real release; any other branch -> a separate test release so a
+      # branch build can never overwrite the exe people are using.
+      - name: Publish to release (main)
+        if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: tool-latest
           name: Matrix Pico Console
           body: >
-            Serial console tool for tuning the Matrix Pico glitcher.
-            Auto-detects the Pico's COM port. Unsigned, so Windows SmartScreen
+            Serial console tool for tuning the Matrix Pico glitcher. Flashes a
+            blank Pico for you (FLASH PICO). Unsigned, so Windows SmartScreen
             will warn on first run - click "More info" then "Run anyway".
+          files: dist/MatrixPicoConsole.exe
+
+      - name: Publish to test release (branches)
+        if: github.ref != 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: tool-test
+          name: Matrix Pico Console (test build)
+          body: Branch test build - not the release.
+          prerelease: true
           files: dist/MatrixPicoConsole.exe

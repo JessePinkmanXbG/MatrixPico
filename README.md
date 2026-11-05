@@ -19,6 +19,15 @@ console boot (or not), repeat — seconds per attempt instead of minutes. Once a
 profile boots reliably, `save` writes it to the Pico's flash so the glitcher
 runs headless inside the console with no PC attached.
 
+## Flashing a blank Pico from the tool
+
+Plug in a Pico with no firmware (or hold BOOTSEL while plugging in), open the
+Matrix Pico tool, pick your console, and press **FLASH PICO**. The tool copies
+the bundled firmware onto the Pico, waits for it to restart, then selects and
+saves that console's profile. No drag-and-drop. A Pico already running Matrix
+Pico firmware is rebooted into update mode automatically (no button press).
+Run from source? Put a built `MatrixPico.uf2` in `tools/assets/`.
+
 ## Wiring (RGH 1.2)
 
 | Pico pin | Xbox 360 point        | Notes                                             |
