@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - 'tools/**'
+      - 'firmware/**'
       - '*.c'
       - '*.pio'
       - 'CMakeLists.txt'
