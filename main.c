@@ -85,7 +85,7 @@
 #define NUM_PROFILES    6
 #define PROFILE_NAME_LEN 16
 /* Test variants get their own magic so they never load each other's saved timings. */
-#define CONFIG_MAGIC    (0x4D505836u ^ ((MP_SYS_CLK_KHZ == 200000) ? 0x100u : 0u) ^ (MP_RST_DRIVEN ? 0x200u : 0u))
+#define CONFIG_MAGIC    (0x4D505836u ^ ((MP_SYS_CLK_KHZ == 200000) ? 0x100u : 0u) ^ 0x400u)  /* diag layout: runtime options in "reserved" */
 #define CONFIG_MAGIC_V5 0x4D505835u   /* "MPX5" - 5-profile layout, migrated on load */
 #define NUM_PROFILES_V5 5
 #define CONFIG_VERSION  1
@@ -152,7 +152,7 @@ static const config_t DEFAULT_CONFIG = {
     .magic   = CONFIG_MAGIC,
     .version = CONFIG_VERSION,
     .active  = 0,
-    .reserved = 0,
+    .reserved = 0x6,   /* DIAG default = A2-equivalent: bit1 driven reset, bit2 POST pull-down */
     .profiles = {
         /* RGH 1.2, 192 MHz values (200 MHz x 0.96, same real-time timing).
          * trinity carries balika011's proven numbers; others are seeds. */
@@ -204,7 +204,7 @@ static void config_load(void)
     if (fc->magic == CONFIG_MAGIC && fc->version == CONFIG_VERSION &&
         fc->active < NUM_PROFILES) {
         memcpy(&g_cfg, fc, sizeof(config_t));
-    } else if (MP_SYS_CLK_KHZ == 192000 && !MP_RST_DRIVEN &&
+    } else if (0 &&
                fc->magic == CONFIG_MAGIC_V5 && fc->version == CONFIG_VERSION &&
                fc->active < NUM_PROFILES_V5) {
         /* Old 5-profile save: keep the user's tuned profiles, add the new ones. */
@@ -468,7 +468,7 @@ static void core1_main(void)
          *   0 = RGH1.2 open-drain, 1 = EXT_CLK, 2 = RGH1.2 + 1-cycle pull-up (rstpull 1). */
         uint m = g_cfg.profiles[g_cfg.active].method;
         bool pullup = (m != METHOD_EXTCLK) && (g_cfg.reserved & 1u);
-        bool driven = (m != METHOD_EXTCLK) && MP_RST_DRIVEN;
+        bool driven = (m != METHOD_EXTCLK) && (g_cfg.reserved & 2u);
         int eng = (m == METHOD_EXTCLK) ? 1 : (driven ? 3 : (pullup ? 2 : 0));
         if (eng != loaded) {
             if (loaded >= 0) {
@@ -531,6 +531,7 @@ static void print_help(void)
         "  save                 write all profiles to flash (persists)\n"
         "  load                 reload profiles from flash (discard edits)\n"
         "  defaults             restore built-in defaults (not saved yet)\n"
+        "  opt [name 0|1]       diagnostic options: driven, postpull, rstpull\n"
         "  rstpull [0|1]        RGH1.2 reset 1-cycle pull-up (diagnostic, default 0=safe)\n"
         "  last                 POST edges counted after the last glitch\n"
         "  bootedges [n]        POST edges needed to count as a real boot (default 6)\n"
@@ -611,6 +612,22 @@ static void handle_line(char *line)
         printf("rstpull = %u  (%s; 'save' to persist)\n", (unsigned)(g_cfg.reserved & 1u),
                (g_cfg.reserved & 1u) ? "1-cycle 3.3V pull-up ON - bench diagnostic only"
                                       : "pure open-drain, safe default");
+    } else if (!strcmp(cmd, "opt")) {
+        char *a = strtok(NULL, " \t"), *b = strtok(NULL, " \t");
+        if (a && b) {
+            uint32_t bit = !strcmp(a, "driven") ? 2u : !strcmp(a, "postpull") ? 4u
+                         : !strcmp(a, "rstpull") ? 1u : 0u;
+            if (!bit) printf("unknown option '%s'\n", a);
+            else if (atoi(b)) g_cfg.reserved |= bit; else g_cfg.reserved &= ~bit;
+            gpio_set_pulls(POST_PIN, false, (g_cfg.reserved & 4u) != 0);
+        }
+        printf("options (usage: opt <driven|postpull|rstpull> <0|1>, then 'save'):\n"
+               "  driven   = %u  (1: reset driven HIGH during window like original PicoRGH; 0: open-drain)\n"
+               "  postpull = %u  (1: POST pull-down on like original; 0: POST pure hi-Z)\n"
+               "  rstpull  = %u  (open-drain only: 1-cycle pull-up)\n"
+               "  clock    = %u kHz\n",
+               (unsigned)!!(g_cfg.reserved & 2u), (unsigned)!!(g_cfg.reserved & 4u),
+               (unsigned)!!(g_cfg.reserved & 1u), (unsigned)MP_SYS_CLK_KHZ);
     } else if (!strcmp(cmd, "last")) {
         printf("POST edges seen after the last glitch: %lu  (boot needs >= %lu)\n",
                (unsigned long)g_last_edges, (unsigned long)g_boot_edges);
@@ -716,9 +733,9 @@ int main(void)
      * or load the net. (Whether a 1.1V high READS is a separate question - see
      * docs/SAFETY.md; on phat it is below the Pico's threshold.) */
     gpio_set_input_enabled(POST_PIN, true);
-    gpio_disable_pulls(POST_PIN);
-
     config_load();
+    /* DIAG: option bit2 = POST pull-down (reset default of the RP2040 pad). */
+    gpio_set_pulls(POST_PIN, false, (g_cfg.reserved & 4u) != 0);
 
     multicore_launch_core1(core1_main);
 
