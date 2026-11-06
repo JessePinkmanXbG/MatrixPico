@@ -443,6 +443,7 @@ static uint32_t          g_trk_val = 0;           /* tracked centre */
 static uint32_t          g_trk_n = 0;             /* flash records */
 static uint32_t          g_trk_miss = 0;          /* misses since last boot / power-up */
 static uint32_t          g_trk_used = 0;          /* value used by the running attempt */
+static absolute_time_t   g_trk_last_end;           /* when the previous attempt ended (nil at power-up) */
 static volatile uint32_t g_trk_post = 0;          /* success value pending flash write */
 
 static void trk_load(void)
@@ -602,6 +603,11 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
         g_cfg.profiles[g_cfg.active].t[g_tune_idx] = tune_val(g_tune_b);
         t2_applied = tune_val(g_tune_b); t2_moved = true;
     } else if (g_cfg.profiles[g_cfg.active].method == METHOD_RGH12) {
+        /* A gap > 20 s since the last attempt means this is a fresh power-on, not a retry:
+         * forget old misses (a power-down 'attempt' must not push the next boot off-centre). */
+        if (is_nil_time(g_trk_last_end) ||
+            absolute_time_diff_us(g_trk_last_end, get_absolute_time()) > 20000000)
+            g_trk_miss = 0;
         g_trk_used = trk_pick();
         g_cfg.profiles[g_cfg.active].t[2] = g_trk_used;
         t2_applied = g_trk_used; t2_moved = true;
@@ -746,6 +752,7 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
         }
     }
 
+    g_trk_last_end = get_absolute_time();
     g_attempts++;
 }
 
