@@ -193,7 +193,7 @@ typedef struct { uint32_t e15, etot, ms; uint8_t done; absolute_time_t t0; } his
 static hist_t g_hist[16];
 static volatile uint32_t g_hist_n = 0;       /* attempts started since boot */
 static volatile uint32_t g_last_edges = 0;   /* POST edges seen 1.5s after the last glitch */
-static volatile uint32_t g_boot_edges = 6;   /* edges needed to call it a real boot */
+static volatile uint32_t g_boot_edges = 3;   /* edges needed to call it a real boot */
 
 /* Sweep (auto-tune) state, shared core0 <-> core1. When active, core1 applies
  * sweep_val to the active profile's timing[sweep_idx] on each attempt and steps
@@ -545,6 +545,7 @@ static void led_tick(void)
     led_set(0);
 }
 
+#define GREEN_GAP_MS 500   /* dark gap between the blue flicker and the green */
 static void led_flicker_start(void)
 {
     g_flick_t0 = get_absolute_time();
@@ -571,6 +572,20 @@ static const pio_program_t *eng_prog(int e)
 {
     return (e == 1) ? &extclk_program : (e == 2) ? &glitch_pu_program
          : (e == 3) ? &MP_DRV_PROG : &glitch_program;
+}
+
+/* Record the verdict of an attempt for tune mode / tracking (called once per attempt). */
+static void judge_note(bool ok)
+{
+    if (g_tune_active) { tune_post(g_tune_b, ok); return; }
+    if (sweep_active || g_cfg.profiles[g_cfg.active].method != METHOD_RGH12) return;
+    if (ok) {
+        g_trk_val = (g_trk_val + g_trk_used) / 2;   /* EMA: one edge hit can't drag it */
+        g_trk_miss = 0;
+        g_trk_post = g_trk_val;
+    } else {
+        g_trk_miss++;
+    }
 }
 
 static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pullup, bool driven)
@@ -686,19 +701,22 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
         bool p = gpio_get(POST_PIN);
         if (p != lastp) { edges++; lastp = p; hh->etot = edges; }
         led_tick();
-        if (!judged && absolute_time_diff_us(t0, get_absolute_time()) > 1500000) {
+        /* Green as soon as the POST edges prove a boot, but never before the 2.5s blue
+         * flicker has ended plus a short dark gap, so it always reads blue -> pause -> green. */
+        if (!judged && edges >= g_boot_edges &&
+            absolute_time_diff_us(get_absolute_time(), delayed_by_ms(g_flick_end, GREEN_GAP_MS)) <= 0) {
             judged = true;
             g_last_edges = edges;
             hh->e15 = edges;
-            if (g_tune_active) tune_post(g_tune_b, edges >= g_boot_edges);
-            if (edges >= g_boot_edges && !g_tune_active && !sweep_active &&
-                g_cfg.profiles[g_cfg.active].method == METHOD_RGH12) {
-                g_trk_val = (g_trk_val + g_trk_used) / 2;   /* EMA: one edge hit can't drag it */
-                g_trk_miss = 0;
-                g_trk_post = g_trk_val;
-            } else if (!g_tune_active && !sweep_active) {
-                g_trk_miss++;
-            }
+            booted = true;
+            judge_note(true);
+            led_green_hold();
+        }
+        if (!judged && absolute_time_diff_us(t0, get_absolute_time()) > 4000000) {
+            judged = true;
+            g_last_edges = edges;
+            hh->e15 = edges;
+            judge_note(edges >= g_boot_edges);
             if (edges >= g_boot_edges) {
                 booted = true;
                 led_green_hold();          /* boot confirmed: solid green 5s */
@@ -710,7 +728,7 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
     }
     hh->ms = (uint32_t)(absolute_time_diff_us(t0, get_absolute_time()) / 1000);
     hh->done = 1;
-    if (!judged) { g_last_edges = edges; hh->e15 = edges; if (g_tune_active) tune_post(g_tune_b, false); else if (!sweep_active) g_trk_miss++; }   /* reset dropped before 1.5s: a miss */
+    if (!judged) { g_last_edges = edges; hh->e15 = edges; judge_note(false); }   /* reset dropped before 1.5s: a miss */
     if (!booted && !red_done) led_red_for(1000);
 
     if (sweep_active) {
