@@ -422,6 +422,69 @@ static void tune_report(bool apply)
     }
 }
 
+
+/* ---- Adaptive tracking --------------------------------------------------
+ * The glitch window drifts ~50 cycles between a cold and a warm console.
+ * Each boot's first attempt starts at the value that last booted (an EMA so
+ * one edge hit can't drag it), and each consecutive miss tries a widening
+ * spread around it. The value is also kept in flash (own sector) so it
+ * survives the Pico losing power. Only t[2] moves, clamped to +-TRK_CLAMP of
+ * the saved profile value. */
+#define TRK_OFFSET   (PICO_FLASH_SIZE_BYTES - 3 * FLASH_SECTOR_SIZE)
+#define TRK_REC_MAX  1024u
+#define TRK_STEP     12
+#define TRK_SLOTS    11            /* 0,+1,-1,... +-5 steps = +-60 cycles */
+#define TRK_CLAMP    150
+static const uint32_t *g_trk_flash = (const uint32_t *)(XIP_BASE + TRK_OFFSET);
+static uint32_t          g_trk_base = 0;          /* saved profile t[2] */
+static uint32_t          g_trk_val = 0;           /* tracked centre */
+static uint32_t          g_trk_n = 0;             /* flash records */
+static uint32_t          g_trk_miss = 0;          /* misses since last boot / power-up */
+static uint32_t          g_trk_used = 0;          /* value used by the running attempt */
+static volatile uint32_t g_trk_post = 0;          /* success value pending flash write */
+
+static void trk_load(void)
+{
+    g_trk_base = g_cfg.profiles[g_cfg.active].t[2];
+    g_trk_val = g_trk_base;
+    uint32_t n = 0, last = 0;
+    while (n < TRK_REC_MAX && g_trk_flash[n] != 0xFFFFFFFFu) { last = g_trk_flash[n]; n++; }
+    g_trk_n = n;
+    if (n && last + TRK_CLAMP >= g_trk_base && last <= g_trk_base + TRK_CLAMP) g_trk_val = last;
+}
+
+static uint32_t trk_pick(void)
+{
+    static const int8_t seq[TRK_SLOTS] = { 0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5 };
+    int32_t v = (int32_t)g_trk_val + (int32_t)seq[g_trk_miss % TRK_SLOTS] * TRK_STEP;
+    int32_t lo = (int32_t)g_trk_base - TRK_CLAMP, hi = (int32_t)g_trk_base + TRK_CLAMP;
+    if (v < lo) v = lo;
+    if (v > hi) v = hi;
+    return (uint32_t)v;
+}
+
+static void trk_service(void)
+{
+    uint32_t v = g_trk_post;
+    if (!v) return;
+    g_trk_post = 0;
+    if (g_trk_n >= TRK_REC_MAX) {                 /* sector full: start over with this value */
+        multicore_lockout_start_blocking();
+        uint32_t ints = save_and_disable_interrupts();
+        flash_range_erase(TRK_OFFSET, FLASH_SECTOR_SIZE);
+        restore_interrupts(ints);
+        multicore_lockout_end_blocking();
+        g_trk_n = 0;
+    }
+    uint32_t byteoff = g_trk_n * 4u;
+    uint32_t page = byteoff & ~(uint32_t)(FLASH_PAGE_SIZE - 1);
+    uint8_t pg[FLASH_PAGE_SIZE];
+    memset(pg, 0xFF, sizeof(pg));
+    memcpy(pg + (byteoff - page), &v, 4);
+    tune_flash_page(TRK_OFFSET + page, pg);
+    g_trk_n++;
+}
+
 /* ---- Status LED --------------------------------------------------------- */
 #if USE_WS2812
 static PIO  led_pio = pio1;
@@ -510,6 +573,8 @@ static const pio_program_t *eng_prog(int e)
 
 static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pullup, bool driven)
 {
+    uint32_t t2_orig = g_cfg.profiles[g_cfg.active].t[2], t2_applied = t2_orig;
+    bool t2_moved = false;
     if (sweep_active)
         g_cfg.profiles[g_cfg.active].t[sweep_idx] = sweep_val;
     else if (g_tune_active) {
@@ -517,6 +582,11 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
         g_rng += (uint32_t)time_us_32();
         g_tune_b = (g_rng >> 8) % tune_nb();
         g_cfg.profiles[g_cfg.active].t[TUNE_IDX] = tune_val(g_tune_b);
+        t2_applied = tune_val(g_tune_b); t2_moved = true;
+    } else if (g_cfg.profiles[g_cfg.active].method == METHOD_RGH12) {
+        g_trk_used = trk_pick();
+        g_cfg.profiles[g_cfg.active].t[2] = g_trk_used;
+        t2_applied = g_trk_used; t2_moved = true;
     }
 
     const uint32_t *t = g_cfg.profiles[g_cfg.active].t;
@@ -581,6 +651,10 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
     pio_sm_put_blocking(pio, sm, t[2]);                      /* delay_to_rst / r_end */
     pio_sm_put_blocking(pio, sm, driven ? MP_DRV_WIDTH(t[3]) : (t[3] > 0 ? t[3] - 1 : 0));   /* glitch_width / pulse_width */
     pio_sm_put_blocking(pio, sm, t[4]);                      /* pll_hold / extc_hold */
+    /* Timings are in the PIO FIFO now: put the saved value back so the profile in RAM
+     * (status / save) always shows what is stored, not the per-attempt value. */
+    if (t2_moved && g_cfg.profiles[g_cfg.active].t[2] == t2_applied)
+        g_cfg.profiles[g_cfg.active].t[2] = t2_orig;
 
     while (pio_sm_is_rx_fifo_empty(pio, sm))
         led_tick();
@@ -614,6 +688,14 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
             g_last_edges = edges;
             hh->e15 = edges;
             if (g_tune_active) tune_post(g_tune_b, edges >= g_boot_edges);
+            if (edges >= g_boot_edges && !g_tune_active && !sweep_active &&
+                g_cfg.profiles[g_cfg.active].method == METHOD_RGH12) {
+                g_trk_val = (g_trk_val + g_trk_used) / 2;   /* EMA: one edge hit can't drag it */
+                g_trk_miss = 0;
+                g_trk_post = g_trk_val;
+            } else if (!g_tune_active && !sweep_active) {
+                g_trk_miss++;
+            }
             if (edges >= g_boot_edges) {
                 booted = true;
                 led_green_hold();          /* boot confirmed: solid green 5s */
@@ -625,7 +707,7 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
     }
     hh->ms = (uint32_t)(absolute_time_diff_us(t0, get_absolute_time()) / 1000);
     hh->done = 1;
-    if (!judged) { g_last_edges = edges; hh->e15 = edges; if (g_tune_active) tune_post(g_tune_b, false); }   /* reset dropped before 1.5s: a miss */
+    if (!judged) { g_last_edges = edges; hh->e15 = edges; if (g_tune_active) tune_post(g_tune_b, false); else if (!sweep_active) g_trk_miss++; }   /* reset dropped before 1.5s: a miss */
     if (!booted && !red_done) led_red_for(1000);
 
     if (sweep_active) {
@@ -717,6 +799,8 @@ static void print_status(void)
     printf("active profile: %s   attempts since boot: %lu\n",
            g_cfg.profiles[g_cfg.active].name, (unsigned long)g_attempts);
     print_profile(g_cfg.active);
+    printf("track: centre %lu (saved base %lu), %lu stored\n", (unsigned long)g_trk_val,
+           (unsigned long)g_trk_base, (unsigned long)g_trk_n);
     if (g_tune_active)
         printf("*** TUNE MODE ON: t[2] randomised %lu +-%lu, %lu attempts logged. 'tunelog' / 'tunecenter' / 'tunestop' ***\n",
                (unsigned long)g_tune_base, (unsigned long)g_tune_half, (unsigned long)g_tune_n);
@@ -792,6 +876,7 @@ static void handle_line(char *line)
         int i = a ? find_profile(a) : -1;
         if (i < 0) { printf("err: use <name|idx>\n"); return; }
         g_cfg.active = (uint32_t)i;
+        g_trk_base = g_cfg.profiles[i].t[2]; g_trk_val = g_trk_base; g_trk_miss = 0;
         printf("active -> %s (unsaved; 'save' to persist)\n", g_cfg.profiles[i].name);
     } else if (!strcmp(cmd, "set")) {
         char *a = strtok(NULL, " \t");
@@ -801,6 +886,7 @@ static void handle_line(char *line)
         if (idx < 0 || idx >= NUM_TIMINGS) { printf("err: idx 0-4\n"); return; }
         uint32_t v = (uint32_t)strtoul(b, NULL, 0);
         g_cfg.profiles[g_cfg.active].t[idx] = v;
+        if (idx == 2) { g_trk_base = v; g_trk_val = v; g_trk_miss = 0; }
         printf("%s.%s = %lu (unsaved)\n", g_cfg.profiles[g_cfg.active].name,
                tname(g_cfg.profiles[g_cfg.active].method, idx), (unsigned long)v);
     } else if (!strcmp(cmd, "name")) {
@@ -984,6 +1070,7 @@ int main(void)
     gpio_set_input_enabled(POST_PIN, true);
     config_load();
     tune_load();
+    trk_load();
     /* DIAG: option bit2 = POST pull-down (reset default of the RP2040 pad). */
     gpio_set_pulls(POST_PIN, false, (g_cfg.reserved & 4u) != 0);
 
@@ -998,6 +1085,7 @@ int main(void)
     while (true) {
         console_task();
         tune_service();
+        trk_service();
         if (sweep_active && sweep_tick != last_tick) {
             last_tick = sweep_tick;
             printf("  sweep: %s = %lu\n", tname(g_cfg.profiles[g_cfg.active].method, sweep_idx),
