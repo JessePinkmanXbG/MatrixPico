@@ -193,7 +193,8 @@ typedef struct { uint32_t e15, etot, ms; uint8_t done; absolute_time_t t0; } his
 static hist_t g_hist[16];
 static volatile uint32_t g_hist_n = 0;       /* attempts started since boot */
 static volatile uint32_t g_last_edges = 0;   /* POST edges seen 1.5s after the last glitch */
-static volatile uint32_t g_boot_edges = 3;   /* edges needed to call it a real boot */
+static volatile uint32_t g_boot_edges = 3;
+static volatile uint32_t g_arm_low_us = 1500;  /* reset must be held LOW this long to count as a real reset (filters power-down blips) */   /* edges needed to call it a real boot */
 
 /* Sweep (auto-tune) state, shared core0 <-> core1. When active, core1 applies
  * sweep_val to the active profile's timing[sweep_idx] on each attempt and steps
@@ -621,8 +622,19 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
 
     gpio_init(arm_pin);
     gpio_set_dir(arm_pin, GPIO_IN);
-    while (!gpio_get(arm_pin))
-        led_tick();                       /* lets a red phase time out while we wait */
+    /* Arm only on a GENUINE reset: the line must be held LOW for at least
+     * g_arm_low_us, then go HIGH. A real power-on (and a failed-glitch SMC retry)
+     * both hold reset low well beyond this; a power-DOWN only blips the line, so
+     * it never satisfies this and the chip will not fire a glitch while the
+     * console is shutting down. */
+    for (;;) {
+        while (gpio_get(arm_pin)) led_tick();          /* wait for LOW */
+        absolute_time_t lo = get_absolute_time();
+        while (!gpio_get(arm_pin)) led_tick();         /* wait for HIGH */
+        if (absolute_time_diff_us(lo, get_absolute_time()) >= (int64_t)g_arm_low_us)
+            break;                                     /* low was long enough: real reset */
+        /* too brief: a shutdown/noise blip - keep waiting for a real reset */
+    }
 
     pio_sm_config c = (method == METHOD_EXTCLK)
         ? extclk_program_get_default_config(offset)
@@ -861,6 +873,7 @@ static void print_help(void)
         "  tunelog / tunecenter / tunestop   show results / apply centre / leave tune mode\n"
         "  hist                 last 16 attempts: POST edges + how long reset stayed high\n"
         "  last                 POST edges counted after the last glitch\n"
+        "  armlow [us]          reset must be held low this long to arm (anti power-down glitch)\n"
         "  bootedges [n]        POST edges needed to count as a real boot (default 6)\n"
         "  attempts             reset the attempt counter\n"
         "  mon                  watch CPU_RESET/POST live for 6s (power-cycle to test)\n"
@@ -973,6 +986,11 @@ static void handle_line(char *line)
     } else if (!strcmp(cmd, "last")) {
         printf("POST edges seen after the last glitch: %lu  (boot needs >= %lu)\n",
                (unsigned long)g_last_edges, (unsigned long)g_boot_edges);
+    } else if (!strcmp(cmd, "armlow")) {
+        char *a = strtok(NULL, " \t");
+        if (a) g_arm_low_us = (uint32_t)strtoul(a, NULL, 0);
+        printf("armlow = %lu us  (reset must be held low this long to arm)\n",
+               (unsigned long)g_arm_low_us);
     } else if (!strcmp(cmd, "bootedges")) {
         char *a = strtok(NULL, " \t");
         if (a) g_boot_edges = (uint32_t)strtoul(a, NULL, 0);
