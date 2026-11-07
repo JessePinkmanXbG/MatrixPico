@@ -97,7 +97,7 @@
 #define CONFIG_MAGIC    (0x4D505836u ^ ((MP_SYS_CLK_KHZ == 200000) ? 0x100u : 0u) ^ 0x400u)  /* diag layout: runtime options in "reserved" */
 #define CONFIG_MAGIC_V5 0x4D505835u   /* "MPX5" - 5-profile layout, migrated on load */
 #define NUM_PROFILES_V5 5
-#define CONFIG_VERSION  1
+#define CONFIG_VERSION  2   /* bumped for autotune: existing saves re-tune from factory */
 
 /* Timing value meanings (index -> role), same order they are fed to the PIO:
  *   [0] post_count   : number of POST pulses to count before arming
@@ -206,6 +206,15 @@ static uint32_t          g_probe_b_us  = 300000;    /* second probe edge: first 
 static uint32_t          g_probe_nom_us = 329723;   /* nominal probe interval (from this console's timeline) */
 static volatile uint32_t g_last_probe_us = 0;       /* diagnostics: last measured probe + applied delay */
 static volatile uint32_t g_last_drst = 0;
+/* ---- Autotune (flash/wire/play) -----------------------------------------
+ * On a fresh install the firmware tunes delay_to_rst itself over the first boots
+ * (it still glitches, so the console boots meanwhile), then captures this board's
+ * probe nominal, turns self-cal on, and locks in - no tool, no commands.
+ * Done is remembered in reserved bit5; selfcal in bit4. */
+static volatile bool g_autotune = false;
+#define AT_HALF   300u     /* autotune sweep half-range (cycles); wide enough for board-to-board offset */
+#define AT_STEP   4u       /* autotune sweep step */
+#define AT_MIN_OK 14u      /* successful boots needed before locking in */
 
 /* Sweep (auto-tune) state, shared core0 <-> core1. When active, core1 applies
  * sweep_val to the active profile's timing[sweep_idx] on each attempt and steps
@@ -239,6 +248,7 @@ static void config_load(void)
         memcpy(&g_cfg, &DEFAULT_CONFIG, sizeof(config_t));
     }
     g_selfcal = (g_cfg.reserved & 16u) != 0;
+    g_autotune = !(g_cfg.reserved & 32u) && g_cfg.profiles[g_cfg.active].method == METHOD_RGH12;
 }
 
 /* Must stop core1 before touching flash: it executes from XIP. */
@@ -518,11 +528,13 @@ static inline void led_off(void)   { led_raw(0); }
 static inline void led_blue(void)  { led_raw(led_rgb(0, 0, 24)); }
 static inline void led_green(void) { led_raw(led_rgb(0, 24, 0)); }
 static inline void led_red(void)   { led_raw(led_rgb(24, 0, 0)); }
+static inline void led_purple(void){ led_raw(led_rgb(16, 0, 24)); }
 #else
 static void led_init(void) { gpio_init(LED_PIN); gpio_set_dir(LED_PIN, GPIO_OUT); }
 static inline void led_off(void)   { gpio_put(LED_PIN, 0); }
 static inline void led_blue(void)  { gpio_put(LED_PIN, 1); }
 static inline void led_green(void) { gpio_put(LED_PIN, 1); }
+static inline void led_purple(void){ gpio_put(LED_PIN, 1); }
 static inline void led_red(void)   { gpio_put(LED_PIN, 1); }
 #endif
 
@@ -543,6 +555,7 @@ static void led_set(int c)
     case 1:  led_blue();  break;
     case 2:  led_red();   break;
     case 3:  led_green(); break;
+    case 4:  led_purple();break;
     default: led_off();   break;
     }
 }
@@ -553,7 +566,7 @@ static void led_tick(void)
     if (absolute_time_diff_us(n, g_red_end) > 0) { led_set(2); return; }
     if (absolute_time_diff_us(n, g_flick_end) > 0) {
         int64_t el = absolute_time_diff_us(g_flick_t0, n);
-        led_set(((el / 17000) & 1) == 0 ? 1 : 0);
+        led_set(((el / 17000) & 1) == 0 ? (g_autotune ? 4 : 1) : 0);
         return;
     }
     led_set(0);
@@ -665,7 +678,11 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
 
     led_flicker_start();      /* 2.5s fast blue flicker, non-blocking */
 
-    bool sc = g_selfcal && (method != METHOD_EXTCLK);
+    /* Measure the probe when self-cal OR autotune is active; only APPLY the
+     * correction for self-cal. Autotune measures it so it can store this board's
+     * probe nominal when it finalises. */
+    bool sc = (g_selfcal || g_autotune) && (method != METHOD_EXTCLK);
+    bool sc_apply = g_selfcal && (method != METHOD_EXTCLK);
     uint32_t drst = t[2];
     uint32_t width_val = driven ? MP_DRV_WIDTH(t[3]) : (t[3] > 0 ? t[3] - 1 : 0);
 
@@ -705,11 +722,13 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
 
         if (have_a && have_b && t_b > t_a) {
             uint32_t probe = t_b - t_a;
-            uint64_t corr = (uint64_t)t[2] * probe / g_probe_nom_us;
-            uint32_t lo = t[2] - t[2] / 32, hi = t[2] + t[2] / 32;   /* clamp +-~3% */
-            if (corr < lo) corr = lo; if (corr > hi) corr = hi;
-            drst = (uint32_t)corr;
             g_last_probe_us = probe;
+            if (sc_apply) {
+                uint64_t corr = (uint64_t)t[2] * probe / g_probe_nom_us;
+                uint32_t lo = t[2] - t[2] / 32, hi = t[2] + t[2] / 32;   /* clamp +-~3% */
+                if (corr < lo) corr = lo; if (corr > hi) corr = hi;
+                drst = (uint32_t)corr;
+            }
         } else {
             g_last_probe_us = 0;                             /* probe failed: use nominal */
         }
@@ -943,6 +962,13 @@ static void print_status(void)
     printf("active profile: %s   attempts since boot: %lu\n",
            g_cfg.profiles[g_cfg.active].name, (unsigned long)g_attempts);
     print_profile(g_cfg.active);
+    if (g_autotune) {
+        uint32_t nb = tune_nb(), okn = 0;
+        for (uint32_t i = 0; i < g_tune_n; i++) { uint16_t r = tune_rec()[i]; if ((r >> 1) < nb && (r & 1)) okn++; }
+        printf("autotune: IN PROGRESS (%lu/%u good boots; keep power-cycling)\n", (unsigned long)okn, AT_MIN_OK);
+    } else if (g_cfg.reserved & 32u) {
+        printf("autotune: done\n");
+    }
     printf("selfcal: %s", g_selfcal ? "ON" : "off");
     if (g_selfcal) {
         printf("  (probe %lu-%lu us, nominal %lu", (unsigned long)g_probe_a_us,
@@ -1169,6 +1195,16 @@ static void handle_line(char *line)
     } else if (!strcmp(cmd, "tunestop")) {
         tune_stop();
         printf("tune mode OFF, saved profile untouched.\n");
+    } else if (!strcmp(cmd, "retune")) {
+        tune_stop();
+        g_cfg.reserved &= ~(16u | 32u);          /* clear selfcal + autotune-done */
+        g_selfcal = false;
+        g_autotune = (g_cfg.profiles[g_cfg.active].method == METHOD_RGH12);
+        if (g_autotune)
+            tune_start(2, g_cfg.profiles[g_cfg.active].t[2], AT_HALF, AT_STEP);
+        config_save();
+        printf("RETUNE: autotune re-armed from delay_to_rst=%lu. Power-cycle the console ~15 times.\n",
+               (unsigned long)g_cfg.profiles[g_cfg.active].t[2]);
     } else if (!strcmp(cmd, "selfcal")) {
         char *a = strtok(NULL, " \t");
         if (a) {
@@ -1230,6 +1266,39 @@ static void console_task(void)
     }
 }
 
+/* core0: once enough autotune boots have logged, compute the centre, store this
+ * board\'s probe nominal, enable self-cal, and lock it in. */
+static void autotune_check(void)
+{
+    if (!g_autotune || !g_tune_active) return;
+    static uint16_t succ[TUNE_MAX_BKT];
+    uint32_t nb = tune_nb();
+    if (nb > TUNE_MAX_BKT) return;
+    memset(succ, 0, sizeof(succ));
+    uint32_t okn = 0;
+    for (uint32_t i = 0; i < g_tune_n; i++) {
+        uint16_t r = tune_rec()[i]; uint32_t b = r >> 1;
+        if (b < nb && (r & 1)) { succ[b]++; okn++; }
+    }
+    if (okn < AT_MIN_OK) return;
+    uint32_t cb, lb, hb;
+    uint32_t used = tune_analyze(succ, nb, &cb, &lb, &hb);
+    if (used < 8) return;
+    uint32_t cv = tune_val(cb);
+    uint32_t base = g_tune_base;                 /* reject a wild centre (bad data) and keep sweeping */
+    if (cv + 1 < (base > AT_HALF ? base - AT_HALF : 0) || cv > base + AT_HALF) return;
+    g_cfg.profiles[g_cfg.active].t[2] = cv;
+    if (g_last_probe_us) g_probe_nom_us = g_last_probe_us;   /* this board\'s probe reference */
+    g_cfg.reserved |= 16u;      /* self-cal ON */
+    g_cfg.reserved |= 32u;      /* autotune DONE */
+    tune_stop();
+    g_selfcal = true;
+    g_autotune = false;
+    config_save();
+    printf("\n*** AUTOTUNE COMPLETE: delay_to_rst = %lu, probe_nom = %lu us, self-cal ON, saved. ***\n> ",
+           (unsigned long)cv, (unsigned long)g_probe_nom_us);
+}
+
 int main(void)
 {
     /* Overclock for glitch-pulse resolution (~5.2 ns/cycle at 192 MHz).
@@ -1272,6 +1341,7 @@ int main(void)
     while (true) {
         console_task();
         tune_service();
+        autotune_check();
         if (sweep_active && sweep_tick != last_tick) {
             last_tick = sweep_tick;
             printf("  sweep: %s = %lu\n", tname(g_cfg.profiles[g_cfg.active].method, sweep_idx),
