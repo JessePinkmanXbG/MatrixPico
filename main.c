@@ -152,7 +152,7 @@ _Static_assert(sizeof(config_t) <= 256, "config must fit one flash page");
  * NOT verified for those boards and MUST be dialed in before they are trusted.
  */
 #if MP_SYS_CLK_KHZ == 200000
-#define TRI_T { 3, 108786906, 7288000, 47, 50000 }    /* proven 200 MHz values */
+#define TRI_T { 3, 108786906, 7287960, 47, 50000 }    /* 200 MHz; delay_to_rst = measured window centre (was 7288000, ~40 cyc high) */
 #else
 #define TRI_T { 3, 104435430, 6996480, 45, 48000 }    /* same real-time at 192 MHz */
 #endif
