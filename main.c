@@ -215,6 +215,8 @@ static volatile bool g_autotune = false;
 #define AT_HALF   150u     /* autotune sweep half-range (cycles); covers the window + margin, converges fast */
 #define AT_STEP   3u       /* autotune sweep step */
 #define AT_MIN_OK 14u      /* successful boots needed before locking in */
+static volatile uint32_t g_last_a_us = 0, g_last_b_us = 0;
+#define SC_MAX_DELTA 1500u    /* max trusted delay_to_rst correction (cycles); bigger = bad probe, rejected */
 
 /* Sweep (auto-tune) state, shared core0 <-> core1. When active, core1 applies
  * sweep_val to the active profile's timing[sweep_idx] on each attempt and steps
@@ -723,14 +725,21 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
         if (have_a && have_b && t_b > t_a) {
             uint32_t probe = t_b - t_a;
             g_last_probe_us = probe;
+            g_last_a_us = t_a - sc_t0;                       /* edge times vs reset, for diag */
+            g_last_b_us = t_b - sc_t0;
             if (sc_apply) {
                 uint64_t corr = (uint64_t)t[2] * probe / g_probe_nom_us;
-                uint32_t lo = t[2] - t[2] / 32, hi = t[2] + t[2] / 32;   /* clamp +-~3% */
-                if (corr < lo) corr = lo; if (corr > hi) corr = hi;
-                drst = (uint32_t)corr;
+                int64_t delta = (int64_t)corr - (int64_t)t[2];
+                /* Real drift is only a handful of ppm; a larger correction means the
+                 * probe caught the wrong edge: REJECT and use nominal. */
+                if (delta > -(int64_t)SC_MAX_DELTA && delta < (int64_t)SC_MAX_DELTA)
+                    drst = (uint32_t)corr;
+                else
+                    drst = t[2];
             }
         } else {
             g_last_probe_us = 0;                             /* probe failed: use nominal */
+            g_last_a_us = g_last_b_us = 0;
         }
         g_last_drst = drst;
         pio_sm_put_blocking(pio, sm, drst);                  /* delay_to_rst (corrected) */
@@ -830,6 +839,11 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
 static const uint8_t *g_tl_flash = (const uint8_t *)(XIP_BASE + TL_OFFSET);
 static volatile bool   g_tl_armed = false;
 typedef struct { uint32_t magic, n; } tl_hdr_t;
+#define SC_OFFSET (PICO_FLASH_SIZE_BYTES - 4 * FLASH_SECTOR_SIZE)
+static const uint8_t *g_sc_flash = (const uint8_t *)(XIP_BASE + SC_OFFSET);
+#define SC_DIAG_MAGIC 0x53434447u
+typedef struct { uint32_t magic, probe, drst, a, b, nominal; } sc_diag_t;
+static uint32_t g_sc_written = 0;
 
 static void tl_write(uint32_t magic, const uint32_t *ts, uint32_t n)
 {
@@ -1205,6 +1219,15 @@ static void handle_line(char *line)
         config_save();
         printf("RETUNE: autotune re-armed from delay_to_rst=%lu. Power-cycle the console ~15 times.\n",
                (unsigned long)g_cfg.profiles[g_cfg.active].t[2]);
+    } else if (!strcmp(cmd, "probelog")) {
+        const sc_diag_t *d = (const sc_diag_t *)g_sc_flash;
+        if (d->magic != SC_DIAG_MAGIC) { printf("no probe logged yet (run selfcal boots first)\n"); }
+        else {
+            printf("last selfcal probe: %lu us (nominal %lu)  edges @ %lu / %lu us from reset\n",
+                   (unsigned long)d->probe, (unsigned long)d->nominal, (unsigned long)d->a, (unsigned long)d->b);
+            printf("applied delay_to_rst = %lu (nominal 7287960); %s\n", (unsigned long)d->drst,
+                   d->drst == 7287960 ? "probe REJECTED -> used nominal (bad probe)" : "correction applied");
+        }
     } else if (!strcmp(cmd, "selfcal")) {
         char *a = strtok(NULL, " \t");
         if (a) {
@@ -1297,6 +1320,25 @@ static void autotune_check(void)
     config_save();
     printf("\n*** AUTOTUNE COMPLETE: delay_to_rst = %lu, probe_nom = %lu us, self-cal ON, saved. ***\n> ",
            (unsigned long)cv, (unsigned long)g_probe_nom_us);
+}
+
+/* Self-cal probe diagnostic, kept in flash so it survives the Pico power-cycling
+ * when USB is (re)connected. core0 writes the latest attempt's probe + applied
+ * delay; 'probelog' reads it back. */
+static void sc_diag_flash(void)
+{
+    if (!g_selfcal || g_last_drst == 0 || g_last_drst == g_sc_written) return;
+    uint8_t pg[FLASH_PAGE_SIZE];
+    memset(pg, 0xFF, sizeof(pg));
+    sc_diag_t d = { SC_DIAG_MAGIC, g_last_probe_us, g_last_drst, g_last_a_us, g_last_b_us, g_probe_nom_us };
+    memcpy(pg, &d, sizeof(d));
+    multicore_lockout_start_blocking();
+    uint32_t ints = save_and_disable_interrupts();
+    flash_range_erase(SC_OFFSET, FLASH_SECTOR_SIZE);
+    flash_range_program(SC_OFFSET, pg, FLASH_PAGE_SIZE);
+    restore_interrupts(ints);
+    multicore_lockout_end_blocking();
+    g_sc_written = g_last_drst;
 }
 
 int main(void)
