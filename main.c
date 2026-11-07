@@ -194,6 +194,18 @@ static hist_t g_hist[16];
 static volatile uint32_t g_hist_n = 0;       /* attempts started since boot */
 static volatile uint32_t g_last_edges = 0;   /* POST edges seen 1.5s after the last glitch */
 static volatile uint32_t g_boot_edges = 3;   /* edges needed to call it a real boot */
+/* ---- Wire-free self-calibration (selfcal) --------------------------------
+ * Each boot, measure a deterministic console POST interval (the edge just after
+ * PROBE_A_US to the edge just after PROBE_B_US from reset release) in the Pico's
+ * own time, and scale delay_to_rst by how far that measurement drifts from
+ * PROBE_NOM_US. This cancels the Pico-vs-console clock drift over the ~36 ms
+ * that actually reaches the glitch. Opt-in (reserved bit4); default OFF. */
+static volatile bool     g_selfcal = false;
+static uint32_t          g_probe_a_us  = 15000;     /* first probe edge: first POST edge after this */
+static uint32_t          g_probe_b_us  = 300000;    /* second probe edge: first POST edge after this */
+static uint32_t          g_probe_nom_us = 329723;   /* nominal probe interval (from this console's timeline) */
+static volatile uint32_t g_last_probe_us = 0;       /* diagnostics: last measured probe + applied delay */
+static volatile uint32_t g_last_drst = 0;
 
 /* Sweep (auto-tune) state, shared core0 <-> core1. When active, core1 applies
  * sweep_val to the active profile's timing[sweep_idx] on each attempt and steps
@@ -226,6 +238,7 @@ static void config_load(void)
     } else {
         memcpy(&g_cfg, &DEFAULT_CONFIG, sizeof(config_t));
     }
+    g_selfcal = (g_cfg.reserved & 16u) != 0;
 }
 
 /* Must stop core1 before touching flash: it executes from XIP. */
@@ -610,6 +623,7 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
     gpio_set_dir(arm_pin, GPIO_IN);
     while (!gpio_get(arm_pin))
         led_tick();                       /* lets a red phase time out while we wait */
+    uint32_t sc_t0 = time_us_32();        /* reset-release moment (selfcal probe reference) */
 
     pio_sm_config c = (method == METHOD_EXTCLK)
         ? extclk_program_get_default_config(offset)
@@ -650,20 +664,61 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
     pio_sm_set_enabled(pio, sm, true);
 
     led_flicker_start();      /* 2.5s fast blue flicker, non-blocking */
-    /* The proven build waited ~200ms here before sending the timing values; keep
-     * that so POST counting starts at exactly the same moment. */
-    { absolute_time_t dl = delayed_by_ms(get_absolute_time(), 204);
-      while (absolute_time_diff_us(get_absolute_time(), dl) > 0) led_tick(); }
 
-    /* Same 5-value feed for both engines (slots mean different things per
-     * method). Reset-low lasts (y + 1) cycles, so pass width-1. */
-    pio_sm_put_blocking(pio, sm, t[0]);                      /* post_count */
-    pio_sm_put_blocking(pio, sm, t[1]);                      /* delay_to_pll / slow_delay */
-    pio_sm_put_blocking(pio, sm, t[2]);                      /* delay_to_rst / r_end */
-    pio_sm_put_blocking(pio, sm, driven ? MP_DRV_WIDTH(t[3]) : (t[3] > 0 ? t[3] - 1 : 0));   /* glitch_width / pulse_width */
-    pio_sm_put_blocking(pio, sm, t[4]);                      /* pll_hold / extc_hold */
-    /* Timings are in the PIO FIFO now: put the saved value back so the profile in RAM
-     * (status / save) always shows what is stored, not the per-attempt value. */
+    bool sc = g_selfcal && (method != METHOD_EXTCLK);
+    uint32_t drst = t[2];
+    uint32_t width_val = driven ? MP_DRV_WIDTH(t[3]) : (t[3] > 0 ? t[3] - 1 : 0);
+
+    if (!sc) {
+        /* The proven build waited ~200ms here before sending the timing values; keep
+         * that so POST counting starts at exactly the same moment. */
+        { absolute_time_t dl = delayed_by_ms(get_absolute_time(), 204);
+          while (absolute_time_diff_us(get_absolute_time(), dl) > 0) led_tick(); }
+        pio_sm_put_blocking(pio, sm, t[0]);                  /* post_count */
+        pio_sm_put_blocking(pio, sm, t[1]);                  /* delay_to_pll */
+        pio_sm_put_blocking(pio, sm, t[2]);                  /* delay_to_rst */
+        pio_sm_put_blocking(pio, sm, width_val);             /* glitch_width */
+        pio_sm_put_blocking(pio, sm, t[4]);                  /* pll_hold */
+    } else {
+        /* SELFCAL: keep the 204 ms pre-delay, but poll POST throughout to time the
+         * probe interval, then feed a drift-corrected delay_to_rst just-in-time
+         * (the PIO does not pull delay_to_rst until after its 544 ms delay_pll). */
+        bool lvl = gpio_get(POST_PIN);
+        uint32_t t_a = 0, t_b = 0;
+        bool have_a = false, have_b = false;
+        #define SC_POLL() do { \
+            bool v_ = gpio_get(POST_PIN); \
+            if (v_ != lvl) { lvl = v_; uint32_t dt_ = time_us_32() - sc_t0; \
+                if (!have_a && dt_ > g_probe_a_us) { t_a = time_us_32(); have_a = true; } \
+                else if (have_a && !have_b && dt_ > g_probe_b_us) { t_b = time_us_32(); have_b = true; } } \
+        } while (0)
+
+        /* 204 ms pre-delay, polling POST */
+        { absolute_time_t dl = delayed_by_ms(get_absolute_time(), 204);
+          while (absolute_time_diff_us(get_absolute_time(), dl) > 0) { SC_POLL(); led_tick(); } }
+        pio_sm_put_blocking(pio, sm, t[0]);                  /* post_count */
+        pio_sm_put_blocking(pio, sm, t[1]);                  /* delay_to_pll */
+
+        /* keep polling until the second probe edge is captured (or give up) */
+        uint32_t guard = time_us_32();
+        while (!have_b && (time_us_32() - guard) < 600000u) { SC_POLL(); led_tick(); }
+
+        if (have_a && have_b && t_b > t_a) {
+            uint32_t probe = t_b - t_a;
+            uint64_t corr = (uint64_t)t[2] * probe / g_probe_nom_us;
+            uint32_t lo = t[2] - t[2] / 32, hi = t[2] + t[2] / 32;   /* clamp +-~3% */
+            if (corr < lo) corr = lo; if (corr > hi) corr = hi;
+            drst = (uint32_t)corr;
+            g_last_probe_us = probe;
+        } else {
+            g_last_probe_us = 0;                             /* probe failed: use nominal */
+        }
+        g_last_drst = drst;
+        pio_sm_put_blocking(pio, sm, drst);                  /* delay_to_rst (corrected) */
+        pio_sm_put_blocking(pio, sm, width_val);             /* glitch_width */
+        pio_sm_put_blocking(pio, sm, t[4]);                  /* pll_hold */
+        #undef SC_POLL
+    }
     if (t2_moved && g_cfg.profiles[g_cfg.active].t[mv_idx] == t2_applied)
         g_cfg.profiles[g_cfg.active].t[mv_idx] = t2_orig;
 
@@ -888,6 +943,16 @@ static void print_status(void)
     printf("active profile: %s   attempts since boot: %lu\n",
            g_cfg.profiles[g_cfg.active].name, (unsigned long)g_attempts);
     print_profile(g_cfg.active);
+    printf("selfcal: %s", g_selfcal ? "ON" : "off");
+    if (g_selfcal) {
+        printf("  (probe %lu-%lu us, nominal %lu", (unsigned long)g_probe_a_us,
+               (unsigned long)g_probe_b_us, (unsigned long)g_probe_nom_us);
+        if (g_last_probe_us) printf("; last probe %lu us -> delay_to_rst %lu",
+               (unsigned long)g_last_probe_us, (unsigned long)g_last_drst);
+        else if (g_last_drst) printf("; last probe FAILED, used nominal");
+        printf(")");
+    }
+    printf("\n");
     if (g_tune_active)
         printf("*** TUNE MODE ON: t[2] randomised %lu +-%lu, %lu attempts logged. 'tunelog' / 'tunecenter' / 'tunestop' ***\n",
                (unsigned long)g_tune_base, (unsigned long)g_tune_half, (unsigned long)g_tune_n);
@@ -1104,6 +1169,24 @@ static void handle_line(char *line)
     } else if (!strcmp(cmd, "tunestop")) {
         tune_stop();
         printf("tune mode OFF, saved profile untouched.\n");
+    } else if (!strcmp(cmd, "selfcal")) {
+        char *a = strtok(NULL, " \t");
+        if (a) {
+            if (atoi(a)) g_cfg.reserved |= 16u; else g_cfg.reserved &= ~16u;
+            g_selfcal = (g_cfg.reserved & 16u) != 0;
+        }
+        printf("selfcal = %u  (wire-free drift correction; 'save' to persist)\n", (unsigned)g_selfcal);
+        printf("probe window %lu..%lu us, nominal %lu us. Set nominal with 'probenom <us>'.\n",
+               (unsigned long)g_probe_a_us, (unsigned long)g_probe_b_us, (unsigned long)g_probe_nom_us);
+    } else if (!strcmp(cmd, "probenom")) {
+        char *a = strtok(NULL, " \t");
+        char *b = strtok(NULL, " \t");
+        char *cc = strtok(NULL, " \t");
+        if (a) g_probe_nom_us = (uint32_t)strtoul(a, NULL, 0);
+        if (b) g_probe_a_us   = (uint32_t)strtoul(b, NULL, 0);
+        if (cc) g_probe_b_us  = (uint32_t)strtoul(cc, NULL, 0);
+        printf("probe nominal %lu us, window %lu..%lu us\n",
+               (unsigned long)g_probe_nom_us, (unsigned long)g_probe_a_us, (unsigned long)g_probe_b_us);
     } else if (!strcmp(cmd, "timeline")) {
         char *a = strtok(NULL, " \t");
         const tl_hdr_t *h = (const tl_hdr_t *)g_tl_flash;
