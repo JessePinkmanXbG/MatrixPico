@@ -212,8 +212,8 @@ static volatile uint32_t g_last_drst = 0;
  * probe nominal, turns self-cal on, and locks in - no tool, no commands.
  * Done is remembered in reserved bit5; selfcal in bit4. */
 static volatile bool g_autotune = false;
-#define AT_HALF   300u     /* autotune sweep half-range (cycles); wide enough for board-to-board offset */
-#define AT_STEP   4u       /* autotune sweep step */
+#define AT_HALF   150u     /* autotune sweep half-range (cycles); covers the window + margin, converges fast */
+#define AT_STEP   3u       /* autotune sweep step */
 #define AT_MIN_OK 14u      /* successful boots needed before locking in */
 
 /* Sweep (auto-tune) state, shared core0 <-> core1. When active, core1 applies
