@@ -579,14 +579,7 @@ static const pio_program_t *eng_prog(int e)
 static void judge_note(bool ok)
 {
     if (g_tune_active) { tune_post(g_tune_b, ok); return; }
-    if (sweep_active || g_cfg.profiles[g_cfg.active].method != METHOD_RGH12) return;
-    if (ok) {
-        g_trk_val = (g_trk_val + g_trk_used) / 2;   /* EMA: one edge hit can't drag it */
-        g_trk_miss = 0;
-        g_trk_post = g_trk_val;
-    } else {
-        g_trk_miss++;
-    }
+    /* fixed-timing build: no per-attempt state is kept */
 }
 
 static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pullup, bool driven)
@@ -602,16 +595,10 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
         g_tune_b = (g_rng >> 8) % tune_nb();
         g_cfg.profiles[g_cfg.active].t[g_tune_idx] = tune_val(g_tune_b);
         t2_applied = tune_val(g_tune_b); t2_moved = true;
-    } else if (g_cfg.profiles[g_cfg.active].method == METHOD_RGH12) {
-        /* A gap > 20 s since the last attempt means this is a fresh power-on, not a retry:
-         * forget old misses (a power-down 'attempt' must not push the next boot off-centre). */
-        if (is_nil_time(g_trk_last_end) ||
-            absolute_time_diff_us(g_trk_last_end, get_absolute_time()) > 20000000)
-            g_trk_miss = 0;
-        g_trk_used = trk_pick();
-        g_cfg.profiles[g_cfg.active].t[2] = g_trk_used;
-        t2_applied = g_trk_used; t2_moved = true;
     }
+    /* FIXED TIMING: the saved profile value is used for every attempt. Nothing
+     * is written to flash during boots, so boot quality can never drift from
+     * stored state. Use 'tune' only as an explicit, opt-in diagnostic. */
 
     const uint32_t *t = g_cfg.profiles[g_cfg.active].t;
 
@@ -827,8 +814,6 @@ static void print_status(void)
     printf("active profile: %s   attempts since boot: %lu\n",
            g_cfg.profiles[g_cfg.active].name, (unsigned long)g_attempts);
     print_profile(g_cfg.active);
-    printf("track: centre %lu (saved base %lu), %lu stored\n", (unsigned long)g_trk_val,
-           (unsigned long)g_trk_base, (unsigned long)g_trk_n);
     if (g_tune_active)
         printf("*** TUNE MODE ON: t[2] randomised %lu +-%lu, %lu attempts logged. 'tunelog' / 'tunecenter' / 'tunestop' ***\n",
                (unsigned long)g_tune_base, (unsigned long)g_tune_half, (unsigned long)g_tune_n);
@@ -1101,7 +1086,6 @@ int main(void)
     gpio_set_input_enabled(POST_PIN, true);
     config_load();
     tune_load();
-    trk_load();
     /* DIAG: option bit2 = POST pull-down (reset default of the RP2040 pad). */
     gpio_set_pulls(POST_PIN, false, (g_cfg.reserved & 4u) != 0);
 
@@ -1116,7 +1100,6 @@ int main(void)
     while (true) {
         console_task();
         tune_service();
-        trk_service();
         if (sweep_active && sweep_tick != last_tick) {
             last_tick = sweep_tick;
             printf("  sweep: %s = %lu\n", tname(g_cfg.profiles[g_cfg.active].method, sweep_idx),
