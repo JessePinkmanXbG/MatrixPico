@@ -68,6 +68,7 @@
 #define PLL_BYPASS  27   /* RGH 1.2: CPU_PLL_BYPASS.  EXT_CLK: CPU_EXT_CLK_EN (same pin) */
 #define POST_PIN    28
 #define RESET_SENSE 29   /* EXT_CLK only: arm-sense on a 3.3V reset point (reset OUT is 1.1V) */
+#define STBY_CLK    20   /* optional: console STBY_CLK in; xclk engine counts its edges */
 
 /* Glitch method per profile. */
 #define METHOD_RGH12   0   /* Trinity/Corona/Falcon/Jasper - PLL bypass */
@@ -193,7 +194,9 @@ typedef struct { uint32_t e15, etot, ms; uint8_t done; absolute_time_t t0; } his
 static hist_t g_hist[16];
 static volatile uint32_t g_hist_n = 0;       /* attempts started since boot */
 static volatile uint32_t g_last_edges = 0;   /* POST edges seen 1.5s after the last glitch */
-static volatile uint32_t g_boot_edges = 3;   /* edges needed to call it a real boot */
+static volatile uint32_t g_boot_edges = 3;
+static volatile bool     g_xclk = false;           /* lock the two long delays to STBY_CLK edges on GP20 */
+static uint32_t          g_stby_khz = 48000;        /* STBY_CLK frequency (measured by the 'xclk' command) */   /* edges needed to call it a real boot */
 
 /* Sweep (auto-tune) state, shared core0 <-> core1. When active, core1 applies
  * sweep_val to the active profile's timing[sweep_idx] on each attempt and steps
@@ -226,6 +229,20 @@ static void config_load(void)
     } else {
         memcpy(&g_cfg, &DEFAULT_CONFIG, sizeof(config_t));
     }
+    g_xclk = (g_cfg.reserved & 8u) != 0;
+}
+
+/* Measure the clock on GP20 (STBY_CLK) with the RP2040 frequency counter. The
+ * pin is momentarily routed to the clock input, then returned to a plain input
+ * for the glitch engine. Run with the console in STANDBY (cord in, console OFF)
+ * so STBY_CLK is live and the switched 3V3 that powers the Pico is dead. */
+static uint32_t measure_stby_khz(void)
+{
+    gpio_set_function(STBY_CLK, GPIO_FUNC_GPCK);
+    uint32_t k = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLKSRC_GPIN0);
+    gpio_init(STBY_CLK);
+    gpio_set_dir(STBY_CLK, GPIO_IN);
+    return k;
 }
 
 /* Must stop core1 before touching flash: it executes from XIP. */
@@ -572,6 +589,7 @@ static void led_green_hold(void)               /* confirmed boot: solid green 5s
 static const pio_program_t *eng_prog(int e)
 {
     return (e == 1) ? &extclk_program : (e == 2) ? &glitch_pu_program
+         : (e == 4) ? &glitch_xclk_program
          : (e == 3) ? &MP_DRV_PROG : &glitch_program;
 }
 
@@ -611,11 +629,24 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
     while (!gpio_get(arm_pin))
         led_tick();                       /* lets a red phase time out while we wait */
 
+    /* xclk engine counts STBY_CLK edges on GP20; if that pin is not toggling the
+     * PIO would wait forever, so verify it is alive first and skip (red) if not. */
+    if (g_xclk && method != METHOD_EXTCLK) {
+        gpio_init(STBY_CLK);
+        gpio_set_dir(STBY_CLK, GPIO_IN);
+        bool seen = false, l0 = gpio_get(STBY_CLK);
+        absolute_time_t dl = delayed_by_ms(get_absolute_time(), 5);
+        while (absolute_time_diff_us(get_absolute_time(), dl) > 0)
+            if (gpio_get(STBY_CLK) != l0) { seen = true; break; }
+        if (!seen) { led_red_for(600); return; }   /* STBY_CLK dead: do NOT start the engine */
+    }
+
     pio_sm_config c = (method == METHOD_EXTCLK)
         ? extclk_program_get_default_config(offset)
-        : (driven ? MP_DRV_CFG(offset)
+        : (driven && g_xclk) ? glitch_xclk_program_get_default_config(offset)
+          : driven ? MP_DRV_CFG(offset)
           : pullup ? glitch_pu_program_get_default_config(offset)
-                   : glitch_program_get_default_config(offset));
+                   : glitch_program_get_default_config(offset);
     sm_config_set_set_pins(&c, CPU_RESET, 2);   /* bit0 = RESET, bit1 = PLL/EXTC */
 #ifndef MP_T_SET
     if (driven) sm_config_set_sideset_pins(&c, CPU_RESET);
@@ -657,9 +688,16 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
 
     /* Same 5-value feed for both engines (slots mean different things per
      * method). Reset-low lasts (y + 1) cycles, so pass width-1. */
+    uint32_t d_pll = t[1], d_rst = t[2];
+    if (g_xclk && method != METHOD_EXTCLK) {
+        /* convert sysclk-cycle delays to STBY_CLK periods (same real time, but
+         * now locked to the console clock so it cannot drift). */
+        d_pll = (uint32_t)((uint64_t)t[1] * g_stby_khz / MP_SYS_CLK_KHZ);
+        d_rst = (uint32_t)((uint64_t)t[2] * g_stby_khz / MP_SYS_CLK_KHZ);
+    }
     pio_sm_put_blocking(pio, sm, t[0]);                      /* post_count */
-    pio_sm_put_blocking(pio, sm, t[1]);                      /* delay_to_pll / slow_delay */
-    pio_sm_put_blocking(pio, sm, t[2]);                      /* delay_to_rst / r_end */
+    pio_sm_put_blocking(pio, sm, d_pll);                     /* delay_to_pll (edges if xclk) */
+    pio_sm_put_blocking(pio, sm, d_rst);                     /* delay_to_rst (edges if xclk) */
     pio_sm_put_blocking(pio, sm, driven ? MP_DRV_WIDTH(t[3]) : (t[3] > 0 ? t[3] - 1 : 0));   /* glitch_width / pulse_width */
     pio_sm_put_blocking(pio, sm, t[4]);                      /* pll_hold / extc_hold */
     /* Timings are in the PIO FIFO now: put the saved value back so the profile in RAM
@@ -775,7 +813,9 @@ static void core1_main(void)
         uint m = g_cfg.profiles[g_cfg.active].method;
         bool pullup = (m != METHOD_EXTCLK) && (g_cfg.reserved & 1u);
         bool driven = (m != METHOD_EXTCLK) && (g_cfg.reserved & 2u);
-        int eng = (m == METHOD_EXTCLK) ? 1 : (driven ? 3 : (pullup ? 2 : 0));
+        int eng = (m == METHOD_EXTCLK) ? 1
+                : (g_xclk && driven) ? 4
+                : (driven ? 3 : (pullup ? 2 : 0));
         if (eng != loaded) {
             if (loaded >= 0) {
                 pio_sm_set_enabled(pio, sm, false);
@@ -814,6 +854,9 @@ static void print_status(void)
     printf("active profile: %s   attempts since boot: %lu\n",
            g_cfg.profiles[g_cfg.active].name, (unsigned long)g_attempts);
     print_profile(g_cfg.active);
+    printf("xclk: %s", g_xclk ? "ON (delays locked to STBY_CLK/GP20)" : "off (free-running Pico clock)");
+    if (g_xclk) printf(", STBY_CLK = %lu kHz", (unsigned long)g_stby_khz);
+    printf("\n");
     if (g_tune_active)
         printf("*** TUNE MODE ON: t[2] randomised %lu +-%lu, %lu attempts logged. 'tunelog' / 'tunecenter' / 'tunestop' ***\n",
                (unsigned long)g_tune_base, (unsigned long)g_tune_half, (unsigned long)g_tune_n);
@@ -840,6 +883,7 @@ static void print_help(void)
         "  save                 write all profiles to flash (persists)\n"
         "  load                 reload profiles from flash (discard edits)\n"
         "  defaults             restore built-in defaults (not saved yet)\n"
+        "  xclk [0|1]           lock delays to console STBY_CLK on GP20 (measures it); 1-attempt fix\n"
         "  opt [name 0|1]       diagnostic options: driven, postpull, rstpull\n"
         "  rstpull [0|1]        RGH1.2 reset 1-cycle pull-up (diagnostic, default 0=safe)\n"
         "  tune [half] [step] [idx]  auto-centre timing idx (default 2 = delay_to_rst; 3 = width), run console unplugged\n"
@@ -908,6 +952,20 @@ static void handle_line(char *line)
         strncpy(g_cfg.profiles[g_cfg.active].name, a, PROFILE_NAME_LEN - 1);
         g_cfg.profiles[g_cfg.active].name[PROFILE_NAME_LEN - 1] = '\0';
         printf("renamed -> %s (unsaved)\n", g_cfg.profiles[g_cfg.active].name);
+    } else if (!strcmp(cmd, "xclk")) {
+        char *a = strtok(NULL, " \t");
+        uint32_t k = measure_stby_khz();
+        if (a) {
+            if (atoi(a)) g_cfg.reserved |= 8u; else g_cfg.reserved &= ~8u;
+            g_xclk = (g_cfg.reserved & 8u) != 0;
+        }
+        bool ok = (k > 1000 && k < 100000);
+        if (ok) g_stby_khz = k;
+        printf("xclk = %u  (lock the two long delays to STBY_CLK edges on GP20)\n", (unsigned)g_xclk);
+        printf("STBY_CLK on GP20 = %lu kHz%s\n", (unsigned long)k,
+               ok ? "" : "  <-- NOT a valid clock: check the GP20 wire before enabling xclk");
+        printf("edge conversion uses %lu kHz; run 'save' to keep xclk mode across power-ups.\n",
+               (unsigned long)g_stby_khz);
     } else if (!strcmp(cmd, "save")) {
         if (g_tune_active) { printf("err: tune mode is on (t[2] is being randomised). 'tunecenter' or 'tunestop' first.\n"); return; }
         config_save();
