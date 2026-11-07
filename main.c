@@ -216,7 +216,10 @@ static volatile bool g_autotune = false;
 #define AT_STEP   3u       /* autotune sweep step */
 #define AT_MIN_OK 14u      /* successful boots needed before locking in */
 static volatile uint32_t g_last_a_us = 0, g_last_b_us = 0;
-#define SC_MAX_DELTA 1500u    /* max trusted delay_to_rst correction (cycles); bigger = bad probe, rejected */
+#define SC_MAX_DELTA 1500u
+#define SC_PAIR_TOL  3000u    /* accept a POST edge pair within +-3 ms of the nominal period */
+#define SC_PAIR_NE   16u
+#define SC_WIN_US    420000u  /* stop polling 420 ms after reset release */    /* max trusted delay_to_rst correction (cycles); bigger = bad probe, rejected */
 
 /* Sweep (auto-tune) state, shared core0 <-> core1. When active, core1 applies
  * sweep_val to the active profile's timing[sweep_idx] on each attempt and steps
@@ -702,14 +705,16 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
         /* SELFCAL: keep the 204 ms pre-delay, but poll POST throughout to time the
          * probe interval, then feed a drift-corrected delay_to_rst just-in-time
          * (the PIO does not pull delay_to_rst until after its 544 ms delay_pll). */
+        /* v3: record every POST edge in the window, then pick the SAME-POLARITY pair
+         * whose spacing best matches the nominal period. Fixed time windows (the old
+         * "first edge after 15 ms / 300 ms") grabbed the wrong edges whenever the early
+         * POST pulse train shifted, which is what broke the probe. */
         bool lvl = gpio_get(POST_PIN);
-        uint32_t t_a = 0, t_b = 0;
-        bool have_a = false, have_b = false;
+        uint32_t e_t[SC_PAIR_NE]; bool e_v[SC_PAIR_NE]; uint32_t ne = 0;
         #define SC_POLL() do { \
             bool v_ = gpio_get(POST_PIN); \
             if (v_ != lvl) { lvl = v_; uint32_t dt_ = time_us_32() - sc_t0; \
-                if (!have_a && dt_ > g_probe_a_us) { t_a = time_us_32(); have_a = true; } \
-                else if (have_a && !have_b && dt_ > g_probe_b_us) { t_b = time_us_32(); have_b = true; } } \
+                if (dt_ < SC_WIN_US && ne < SC_PAIR_NE) { e_t[ne] = dt_; e_v[ne] = v_; ne++; } } \
         } while (0)
 
         /* 204 ms pre-delay, polling POST */
@@ -718,15 +723,26 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
         pio_sm_put_blocking(pio, sm, t[0]);                  /* post_count */
         pio_sm_put_blocking(pio, sm, t[1]);                  /* delay_to_pll */
 
-        /* keep polling until the second probe edge is captured (or give up) */
-        uint32_t guard = time_us_32();
-        while (!have_b && (time_us_32() - guard) < 600000u) { SC_POLL(); led_tick(); }
+        /* keep polling until the window closes (must still feed delay_to_rst before
+         * the PIO reaches it after its 544 ms delay_pll) */
+        while ((time_us_32() - sc_t0) < SC_WIN_US) { SC_POLL(); led_tick(); }
 
-        if (have_a && have_b && t_b > t_a) {
-            uint32_t probe = t_b - t_a;
+        bool have_pair = false; uint32_t pa = 0, pb = 0, best = 0xFFFFFFFFu;
+        for (uint32_t i = 0; i < ne; i++) {
+            if (e_t[i] < g_probe_a_us) continue;             /* ignore the earliest pulses */
+            for (uint32_t k = i + 1; k < ne; k++) {
+                if (e_v[k] != e_v[i]) continue;               /* same polarity only */
+                uint32_t d = e_t[k] - e_t[i];
+                uint32_t dev = (d > g_probe_nom_us) ? d - g_probe_nom_us : g_probe_nom_us - d;
+                if (dev <= SC_PAIR_TOL && dev < best) { best = dev; pa = e_t[i]; pb = e_t[k]; have_pair = true; }
+            }
+        }
+
+        if (have_pair) {
+            uint32_t probe = pb - pa;
             g_last_probe_us = probe;
-            g_last_a_us = t_a - sc_t0;                       /* edge times vs reset, for diag */
-            g_last_b_us = t_b - sc_t0;
+            g_last_a_us = pa;                                /* edge times vs reset, for diag */
+            g_last_b_us = pb;
             if (sc_apply) {
                 uint64_t corr = (uint64_t)t[2] * probe / g_probe_nom_us;
                 int64_t delta = (int64_t)corr - (int64_t)t[2];
@@ -738,7 +754,7 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
                     drst = t[2];
             }
         } else {
-            g_last_probe_us = 0;                             /* probe failed: use nominal */
+            g_last_probe_us = 0;                             /* no matching pair: use nominal */
             g_last_a_us = g_last_b_us = 0;
         }
         g_last_drst = drst;
@@ -1311,7 +1327,8 @@ static void autotune_check(void)
     uint32_t base = g_tune_base;                 /* reject a wild centre (bad data) and keep sweeping */
     if (cv + 1 < (base > AT_HALF ? base - AT_HALF : 0) || cv > base + AT_HALF) return;
     g_cfg.profiles[g_cfg.active].t[2] = cv;
-    if (g_last_probe_us) g_probe_nom_us = g_last_probe_us;   /* this board\'s probe reference */
+    if (g_last_probe_us) { int32_t dv_ = (int32_t)g_last_probe_us - (int32_t)g_probe_nom_us;
+        if (dv_ > -(int32_t)SC_PAIR_TOL && dv_ < (int32_t)SC_PAIR_TOL) g_probe_nom_us = g_last_probe_us; }   /* this board\'s probe reference */
     g_cfg.reserved |= 16u;      /* self-cal ON */
     g_cfg.reserved |= 32u;      /* autotune DONE */
     tune_stop();
