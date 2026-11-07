@@ -743,6 +743,79 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
     g_attempts++;
 }
 
+/* ---- POST timeline capture (wire-free drift study) ----------------------
+ * Records the microsecond time of every POST edge during one boot, WITHOUT
+ * glitching (the console hangs at the glitch point, which is fine - we only
+ * want to see where the POST edges fall). Dumped later over USB with
+ * 'timeline'. Lets us find a POST edge closer to the glitch to re-sync on, or
+ * a stable inter-edge interval to use as a clock-ratio probe. */
+#define TL_OFFSET      (PICO_FLASH_SIZE_BYTES - 3 * FLASH_SECTOR_SIZE)
+#define TL_MAGIC_ARMED 0x544C4152u
+#define TL_MAGIC_DONE  0x544C444Eu
+#define TL_MAX         480u
+static const uint8_t *g_tl_flash = (const uint8_t *)(XIP_BASE + TL_OFFSET);
+static volatile bool   g_tl_armed = false;
+typedef struct { uint32_t magic, n; } tl_hdr_t;
+
+static void tl_write(uint32_t magic, const uint32_t *ts, uint32_t n)
+{
+    static uint8_t buf[FLASH_SECTOR_SIZE];
+    memset(buf, 0xFF, sizeof(buf));
+    tl_hdr_t h = { magic, n };
+    memcpy(buf, &h, sizeof(h));
+    if (n > TL_MAX) n = TL_MAX;
+    if (n) memcpy(buf + 256, ts, n * 4);
+    multicore_lockout_start_blocking();
+    uint32_t ints = save_and_disable_interrupts();
+    flash_range_erase(TL_OFFSET, FLASH_SECTOR_SIZE);
+    flash_range_program(TL_OFFSET, buf, FLASH_SECTOR_SIZE);
+    restore_interrupts(ints);
+    multicore_lockout_end_blocking();
+}
+
+/* core0 runs this when armed: capture one boot's POST edges, store, disarm. */
+static void tl_capture(void)
+{
+    static uint32_t ts[TL_MAX];
+    gpio_init(CPU_RESET);     gpio_set_dir(CPU_RESET, GPIO_IN);
+    gpio_init(POST_PIN);      gpio_set_dir(POST_PIN, GPIO_IN);
+    led_blue();                                   /* solid blue = capturing */
+    { uint32_t w0 = time_us_32();                 /* wait reset release, but give up after 12s */
+      while (!gpio_get(CPU_RESET)) {
+          if (time_us_32() - w0 > 12000000u) { led_off(); return; }  /* no boot: stay armed */
+          tight_loop_contents();
+      } }
+    uint32_t t0 = time_us_32(), last_edge = t0, n = 0;
+    bool lvl = gpio_get(POST_PIN);
+    for (;;) {
+        bool v = gpio_get(POST_PIN);
+        uint32_t now = time_us_32();
+        if (v != lvl) { if (n < TL_MAX) ts[n++] = now - t0; lvl = v; last_edge = now; }
+        if (n >= TL_MAX) break;
+        if (n > 0 && (now - last_edge) > 800000u) break;  /* boot hung: done */
+        if ((now - t0) > 2500000u) break;                 /* 2.5s hard cap */
+    }
+    tl_write(TL_MAGIC_DONE, ts, n);
+    g_tl_armed = false;
+    led_green();                                  /* solid green = capture done */
+}
+
+static void tl_dump(void)
+{
+    const tl_hdr_t *h = (const tl_hdr_t *)g_tl_flash;
+    if (h->magic != TL_MAGIC_DONE) { printf("no capture stored. run 'timeline' to arm, boot once, then 'timeline' again.\n"); return; }
+    const uint32_t *ts = (const uint32_t *)(g_tl_flash + 256);
+    uint32_t n = h->n > TL_MAX ? TL_MAX : h->n;
+    printf("POST timeline: %lu edges (us from reset release)\n idx   t_us    dt_us\n", (unsigned long)n);
+    uint32_t prev = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        printf("%4lu %8lu %8lu\n", (unsigned long)i, (unsigned long)ts[i], (unsigned long)(ts[i] - prev));
+        prev = ts[i];
+    }
+    printf("(last edge at %lu us; glitch would fire ~36 ms after the final POST edge)\n",
+           (unsigned long)(n ? ts[n-1] : 0));
+}
+
 static void core1_main(void)
 {
     /* Allow core0 to pause us while it writes flash. */
@@ -769,6 +842,7 @@ static void core1_main(void)
     uint offset = 0;
 
     while (true) {
+        if (g_tl_armed) { led_blue(); sleep_ms(50); continue; }   /* timeline capture: core1 must not glitch */
         /* (Re)load the engine for the active profile. Programs don't fit in one
          * PIO at once, so we swap when the engine changes:
          *   0 = RGH1.2 open-drain, 1 = EXT_CLK, 2 = RGH1.2 + 1-cycle pull-up (rstpull 1). */
@@ -1030,6 +1104,17 @@ static void handle_line(char *line)
     } else if (!strcmp(cmd, "tunestop")) {
         tune_stop();
         printf("tune mode OFF, saved profile untouched.\n");
+    } else if (!strcmp(cmd, "timeline")) {
+        char *a = strtok(NULL, " \t");
+        const tl_hdr_t *h = (const tl_hdr_t *)g_tl_flash;
+        if (!a && h->magic == TL_MAGIC_DONE) {
+            tl_dump();
+        } else {
+            tl_write(TL_MAGIC_ARMED, NULL, 0);
+            g_tl_armed = true;
+            printf("TIMELINE ARMED. Unplug USB, power the console ON once (it will NOT boot - expected),\n"
+                   "let it sit ~5s, power OFF, plug USB back in (console OFF), and run 'timeline' to see the POST map.\n");
+        }
     } else if (!strcmp(cmd, "sweepstop")) {
         sweep_active = false;
         printf("sweep stopped at %s=%lu ('save' to keep).\n",
@@ -1089,7 +1174,11 @@ int main(void)
     /* DIAG: option bit2 = POST pull-down (reset default of the RP2040 pad). */
     gpio_set_pulls(POST_PIN, false, (g_cfg.reserved & 4u) != 0);
 
+    if (((const tl_hdr_t *)g_tl_flash)->magic == TL_MAGIC_ARMED) g_tl_armed = true;
+
     multicore_launch_core1(core1_main);
+
+    if (g_tl_armed) tl_capture();   /* armed: record this boot's POST timeline, then disarm */
 
     sleep_ms(500);
     print_banner();
