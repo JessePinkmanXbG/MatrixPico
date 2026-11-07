@@ -1316,6 +1316,7 @@ int main(void)
     while (true) {
         console_task();
         tune_service();
+        sc_diag_flash();
         if (sweep_active && sweep_tick != last_tick) {
             last_tick = sweep_tick;
             printf("  sweep: %s = %lu\n", tname(g_cfg.profiles[g_cfg.active].method, sweep_idx),
