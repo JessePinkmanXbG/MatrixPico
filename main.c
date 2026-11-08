@@ -175,11 +175,13 @@ static void led_init(void) {
 static inline void led_off(void)   { led_raw(0); }
 static inline void led_blue(void)  { led_raw(led_rgb(0, 0, 24)); }
 static inline void led_green(void) { led_raw(led_rgb(0, 24, 0)); }
+static inline void led_orange(void){ led_raw(led_rgb(40, 12, 0)); }
 #else
 static void led_init(void) { gpio_init(LED_PIN); gpio_set_dir(LED_PIN, GPIO_OUT); }
 static inline void led_off(void)   { gpio_put(LED_PIN, 0); }
 static inline void led_blue(void)  { gpio_put(LED_PIN, 1); }
 static inline void led_green(void) { gpio_put(LED_PIN, 1); }
+static inline void led_orange(void){ gpio_put(LED_PIN, 1); }
 #endif
 
 /* ---- Glitch core (core1) ------------------------------------------------ */
@@ -234,18 +236,33 @@ static void run_glitch_once(PIO pio, uint sm, uint offset)
     gpio_init(CPU_RESET);
     gpio_set_dir(CPU_RESET, GPIO_IN);
 
-    /* If CPU_RESET stays high, the console came up -> solid green. If it drops
-     * quickly, the glitch missed and we loop round for another attempt. */
+    /* After the glitch (timing is no longer affected): judge the attempt.
+     * A hung/failed attempt also leaves reset high for seconds, so reset-high alone
+     * is not proof of a boot. A real boot keeps changing POST, so count POST edges.
+     *   >= 3 edges          -> boot: green blinks 5 times, then solid green
+     *   < 3 edges at 4 s    -> miss: orange (a retry follows)
+     *   reset drops early   -> miss: orange                                      */
     absolute_time_t t0 = get_absolute_time();
-    bool booted = false;
+    bool lastp = gpio_get(POST_PIN);
+    uint32_t edges = 0;
+    bool booted = false, missed = false;
     while (gpio_get(CPU_RESET)) {
-        if (!booted && absolute_time_diff_us(t0, get_absolute_time()) > 2000000) {
-            led_green();
-            booted = true;
+        bool p = gpio_get(POST_PIN);
+        if (p != lastp) { edges++; lastp = p; }
+        if (!booted && !missed) {
+            if (edges >= 3) {
+                booted = true;
+                for (int i = 0; i < 5; i++) { led_green(); sleep_ms(250); led_off(); sleep_ms(250); }
+                led_green();                               /* solid green while it runs */
+            } else if (absolute_time_diff_us(t0, get_absolute_time()) > 4000000) {
+                missed = true;
+                led_orange();                              /* failed: retrying */
+            }
         }
         tight_loop_contents();
     }
-    led_off();
+    if (booted) led_off();                                 /* console went down */
+    else led_orange();                                     /* missed: orange until the next attempt */
 
     g_attempts++;
 }
