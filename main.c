@@ -613,6 +613,10 @@ static void judge_note(bool ok)
     /* fixed-timing build: no per-attempt state is kept */
 }
 
+#define FR_MAX     3u     /* forced resets allowed per Pico power-up */
+#define FR_HOLD_MS 200u   /* how long reset is held low on a forced reset */
+static uint32_t g_fr_count = 0;
+
 static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pullup, bool driven)
 {
     uint32_t mv_idx = g_tune_active ? g_tune_idx : 2;
@@ -817,6 +821,16 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
             } else {
                 led_red_for(1000);         /* hung: red 1s, keep waiting for the reset */
                 red_done = true;
+                /* FORCED RESET (capped): pull reset low for FR_HOLD_MS, release, and
+                 * leave this loop. The next run_glitch_once() waits for reset high,
+                 * so the release starts the next attempt with no power cycle. */
+                if (g_fr_count < FR_MAX) {
+                    g_fr_count++;
+                    gpio_set_dir(arm_pin, GPIO_OUT); gpio_put(arm_pin, 0);
+                    sleep_ms(FR_HOLD_MS);
+                    gpio_set_dir(arm_pin, GPIO_IN);
+                    break;
+                }
             }
         }
     }
