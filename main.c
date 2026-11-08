@@ -253,7 +253,7 @@ static void config_load(void)
         memcpy(&g_cfg, &DEFAULT_CONFIG, sizeof(config_t));
     }
     g_selfcal = (g_cfg.reserved & 16u) != 0;
-    g_autotune = !(g_cfg.reserved & 32u) && g_cfg.profiles[g_cfg.active].method == METHOD_RGH12;
+    g_autotune = false;   /* DARK-LED test build: autotune OFF so the sweep can't change timing mid-test */
 }
 
 /* Must stop core1 before touching flash: it executes from XIP. */
