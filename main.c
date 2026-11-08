@@ -239,7 +239,7 @@ static void run_glitch_once(PIO pio, uint sm, uint offset)
     /* After the glitch (timing is no longer affected): judge the attempt.
      * A hung/failed attempt also leaves reset high for seconds, so reset-high alone
      * is not proof of a boot. A real boot keeps changing POST, so count POST edges.
-     *   >= 3 edges          -> boot: green blinks 5 times, then solid green
+     *   >= 3 edges          -> boot: solid green
      *   < 3 edges at 4 s    -> miss: orange (a retry follows)
      *   reset drops early   -> miss: orange                                      */
     absolute_time_t t0 = get_absolute_time();
@@ -252,7 +252,6 @@ static void run_glitch_once(PIO pio, uint sm, uint offset)
         if (!booted && !missed) {
             if (edges >= 3) {
                 booted = true;
-                for (int i = 0; i < 5; i++) { led_green(); sleep_ms(250); led_off(); sleep_ms(250); }
                 led_green();                               /* solid green while it runs */
             } else if (absolute_time_diff_us(t0, get_absolute_time()) > 4000000) {
                 missed = true;
