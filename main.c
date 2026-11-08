@@ -681,7 +681,9 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method, bool pul
     pio_sm_init(pio, sm, offset, &c);
     pio_sm_set_enabled(pio, sm, true);
 
-    led_flicker_start();      /* 2.5s fast blue flicker, non-blocking */
+    /* DARK-LED test: no blue flicker during the attempt (LED noise near the reset
+     * edge is a suspect). Feedback is the red/green result after the judge. */
+    g_flick_t0 = get_absolute_time(); g_flick_end = g_flick_t0;
 
     /* Measure the probe when self-cal OR autotune is active; only APPLY the
      * correction for self-cal. Autotune measures it so it can store this board's
