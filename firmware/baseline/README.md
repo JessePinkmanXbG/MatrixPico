@@ -9,13 +9,12 @@ The binary matches a rebuild of that commit byte-for-byte except for the build-d
 Results on the test console:
 - 17 of 30 boots on attempt 1 (57%), 29 of 30 within 2 attempts.
 
-SAFETY WARNING: this build DRIVES the reset line HIGH at 3.3 V (glitch.pio uses side-set
-on pin 26 for every instruction). That is NOT open-drain, so it breaks the rule in
-docs/SAFETY.md, which was written after this build (commit 6ca68d8, 2026-11-04).
-Open-drain reset never booted on Trinity in our tests, so this build's driven reset is
-likely why it works. It is the same approach as the original PicoRGH. Risk on Trinity
-(Slim, 3.3 V reset point) is unmeasured for long-term use. Do not treat this file as
-meeting the open-drain safety rule.
+SAFETY NOTE: this build drives the reset line high (original PicoRGH engine), the same
+as every Trinity build we have bench-tested; open-drain reset never booted on Trinity
+(0 of 5). The Trinity reset point reads as logic-high on the Pico input while floating
+(above ~2V, so not a 1.1V net), which suggests a 3.3V reset point, but this is NOT
+measured. See docs/SAFETY.md. Measure the reset point against ground with the console on
+before relying on it; if it reads near 1.1V, do not use this firmware.
 
 Do not change this file. Any new work goes in a separate build and must beat this baseline
 on a 20-boot run before it replaces it.
