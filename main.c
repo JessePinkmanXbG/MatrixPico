@@ -131,6 +131,13 @@ static const uint8_t *g_flash_cfg = (const uint8_t *)(XIP_BASE + FLASH_TARGET_OF
 /* Shared glitch counter so the console can report activity. */
 static volatile uint32_t g_attempts = 0;
 
+/* Timing log (measurement build): for each attempt, time from "glitch sent" to the
+ * 3rd POST edge (boot confirmed, 0 = never) and to reset dropping (0 = still high). */
+#define ST_N 24
+static volatile uint32_t g_st_conf[ST_N];
+static volatile uint32_t g_st_drop[ST_N];
+static volatile uint32_t g_st_cnt = 0;
+
 /* ---- Flash persistence -------------------------------------------------- */
 
 static void config_load(void)
@@ -244,14 +251,23 @@ static void run_glitch_once(PIO pio, uint sm, uint offset)
     bool lastp = gpio_get(POST_PIN);
     uint32_t edges = 0;
     bool booted = false;
+    absolute_time_t st0 = get_absolute_time();
+    uint32_t conf_us = 0;
     while (gpio_get(CPU_RESET)) {
         bool p = gpio_get(POST_PIN);
         if (p != lastp) { edges++; lastp = p; }
         if (!booted && edges >= 3) {
             booted = true;
+            conf_us = (uint32_t)absolute_time_diff_us(st0, get_absolute_time());
             led_green();                                   /* solid green while it runs */
         }
         tight_loop_contents();
+    }
+    {   /* log this attempt */
+        uint32_t i = g_st_cnt % ST_N;
+        g_st_conf[i] = conf_us;
+        g_st_drop[i] = (uint32_t)absolute_time_diff_us(st0, get_absolute_time());
+        g_st_cnt++;
     }
     if (booted) led_off();                                 /* console went down */
     /* else: still orange -> failed attempt, a retry follows (next attempt turns it blue) */
@@ -323,6 +339,8 @@ static void print_help(void)
         "  load                 reload profiles from flash (discard edits)\n"
         "  defaults             restore built-in defaults (not saved yet)\n"
         "  attempts             reset the attempt counter\n"
+        "  stats                timing of the last attempts (measurement build)\n"
+        "  clearstats           clear the timing log\n"
         "  mon                  watch CPU_RESET/POST live for 6s (power-cycle to test)\n"
         "timing index: 0 post_count  1 delay_to_pll  2 delay_to_rst\n"
         "              3 glitch_width 4 pll_hold\n");
@@ -389,6 +407,19 @@ static void handle_line(char *line)
     } else if (!strcmp(cmd, "defaults")) {
         memcpy(&g_cfg, &DEFAULT_CONFIG, sizeof(config_t));
         printf("defaults restored (unsaved; 'save' to persist).\n");
+    } else if (!strcmp(cmd, "stats")) {
+        uint32_t n = g_st_cnt, shown = n < ST_N ? n : ST_N;
+        printf("attempts logged: %lu (showing last %lu)\n", (unsigned long)n, (unsigned long)shown);
+        printf(" #   confirm_ms   reset_high_ms\n");
+        for (uint32_t k = 0; k < shown; k++) {
+            uint32_t idx = (n - shown + k) % ST_N;
+            uint32_t cf = g_st_conf[idx], dp = g_st_drop[idx];
+            if (cf) printf("%2lu   %8lu     %10lu   BOOTED\n", (unsigned long)(k+1), (unsigned long)(cf/1000), (unsigned long)(dp/1000));
+            else    printf("%2lu   %8s     %10lu   failed\n", (unsigned long)(k+1), "-", (unsigned long)(dp/1000));
+        }
+    } else if (!strcmp(cmd, "clearstats")) {
+        g_st_cnt = 0;
+        printf("stats cleared.\n");
     } else if (!strcmp(cmd, "attempts")) {
         g_attempts = 0;
         printf("attempt counter reset.\n");
