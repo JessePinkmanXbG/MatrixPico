@@ -231,37 +231,30 @@ static void run_glitch_once(PIO pio, uint sm, uint offset)
     pio_sm_set_enabled(pio, sm, false);
     pio_sm_restart(pio, sm);
 
-    led_off();
+    led_orange();         /* glitch sent, boot NOT confirmed yet: orange */
 
     gpio_init(CPU_RESET);
     gpio_set_dir(CPU_RESET, GPIO_IN);
 
-    /* After the glitch (timing is no longer affected): judge the attempt.
-     * A hung/failed attempt also leaves reset high for seconds, so reset-high alone
-     * is not proof of a boot. A real boot keeps changing POST, so count POST edges.
-     *   >= 3 edges          -> boot: solid green
-     *   < 3 edges at 4 s    -> miss: orange (a retry follows)
-     *   reset drops early   -> miss: orange                                      */
-    absolute_time_t t0 = get_absolute_time();
+    /* After the glitch (timing is no longer affected): the LED stays ORANGE until the
+     * boot is confirmed. A hung/failed attempt also leaves reset high for seconds, so
+     * reset-high alone is not proof; a real boot keeps changing POST, so count edges.
+     *   >= 3 POST edges  -> confirmed: solid green
+     *   reset drops / hung -> stays orange until the next attempt starts (blue)    */
     bool lastp = gpio_get(POST_PIN);
     uint32_t edges = 0;
-    bool booted = false, missed = false;
+    bool booted = false;
     while (gpio_get(CPU_RESET)) {
         bool p = gpio_get(POST_PIN);
         if (p != lastp) { edges++; lastp = p; }
-        if (!booted && !missed) {
-            if (edges >= 3) {
-                booted = true;
-                led_green();                               /* solid green while it runs */
-            } else if (absolute_time_diff_us(t0, get_absolute_time()) > 4000000) {
-                missed = true;
-                led_orange();                              /* failed: retrying */
-            }
+        if (!booted && edges >= 3) {
+            booted = true;
+            led_green();                                   /* solid green while it runs */
         }
         tight_loop_contents();
     }
     if (booted) led_off();                                 /* console went down */
-    else led_orange();                                     /* missed: orange until the next attempt */
+    /* else: still orange -> failed attempt, a retry follows (next attempt turns it blue) */
 
     g_attempts++;
 }
