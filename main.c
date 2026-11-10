@@ -147,7 +147,10 @@ _Static_assert(sizeof(config_t) <= 256, "config must fit one flash page");
 static const config_t DEFAULT_CONFIG = {
     .magic   = CONFIG_MAGIC,
     .version = CONFIG_VERSION,
-    .active  = 0,
+#ifndef MP_ACTIVE
+#define MP_ACTIVE 0
+#endif
+    .active  = MP_ACTIVE,
     .reserved = 0,
     .profiles = {
         /* RGH 1.2, 192 MHz values (200 MHz x 0.96, same real-time timing).
