@@ -292,6 +292,8 @@ static void cmd_adcmon(uint32_t secs)
     printf("Power the console OFF now, start it, and let it run through this window.\n");
     printf("(pausing the glitch loop for the capture - this is expected)\n");
 
+    uint32_t attempts_before = g_attempts;   /* sanity check: core1 must not advance this below */
+
     multicore_lockout_start_blocking();   /* core1 must not touch GP28/29 mid-reconfig */
 
     adc_init();
@@ -371,6 +373,15 @@ static void cmd_adcmon(uint32_t secs)
     gpio_set_dir(RESET_SENSE, GPIO_IN);
 
     multicore_lockout_end_blocking();
+
+    uint32_t attempts_during = g_attempts - attempts_before;
+    if (attempts_during > 0) {
+        printf("WARNING: %lu glitch attempt(s) ran on core1 DURING this capture -\n"
+               "the lockout did not hold. Readings above may reflect a real glitch\n"
+               "pulse hitting the console, not a clean power-on. Do not trust this\n"
+               "run's edge times; treat as a firmware bug and stop testing until\n"
+               "this prints 0 attempts.\n", (unsigned long)attempts_during);
+    }
 
     adc_hist_t *h = &g_adc_hist[g_adc_hist_n % ADC_HIST_N];
     h->post_edge = post_edge; h->post_us = post_edge_us; h->post_toggled = post_toggled;
