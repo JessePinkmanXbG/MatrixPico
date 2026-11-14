@@ -33,6 +33,7 @@ target_link_libraries(${PROJECT_NAME}
     hardware_gpio
     hardware_pio
     hardware_flash
+    hardware_adc
     hardware_sync
 )
 

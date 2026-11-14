@@ -36,6 +36,7 @@
 #include "hardware/pio.h"
 #include "hardware/flash.h"
 #include "hardware/sync.h"
+#include "hardware/adc.h"
 #include "glitch.pio.h"
 #include "extclk.pio.h"
 
@@ -555,6 +556,7 @@ static void print_help(void)
         "  bootedges [n]        POST edges needed to count as a real boot (default 3)\n"
         "  attempts             reset the attempt counter\n"
         "  mon                  watch CPU_RESET/POST live for 6s (power-cycle to test)\n"
+        "  adc                  measure GP26/GP28 voltage for 6s (power-cycle to test)\n"
         "  sweep <i> <a> <b> [s] auto-step timing i from a to b until it boots\n"
         "  sweepstop            cancel an active sweep\n"
         "timing index: 0 post_count  1 delay_to_pll  2 delay_to_rst\n"
@@ -659,6 +661,37 @@ static void handle_line(char *line)
         printf("POST(28):      %s\n",
                (ph && pl) ? "TOGGLED  (seen high & low - wire good)" :
                (ph ? "always HIGH (stuck)" : "always LOW  (no POST - check this wire)"));
+    } else if (!strcmp(cmd, "adc")) {
+        /* The Pico as a voltmeter: GP26 (ADC0) and GP28 (ADC2) are analog-capable, so read
+         * the real voltage on the reset and POST pads (0-3.3 V, ~+-50 mV). Input only. */
+        printf("measuring voltage on GP26 (reset) and GP28 (POST) for 6s - power-cycle the console now...\n");
+        adc_init();
+        adc_gpio_init(CPU_RESET);
+        adc_gpio_init(POST_PIN);
+        uint32_t mn[2] = {4095, 4095}, mx[2] = {0, 0}, n = 0;
+        uint64_t sm[2] = {0, 0};
+        absolute_time_t t0 = get_absolute_time();
+        while (absolute_time_diff_us(t0, get_absolute_time()) < 6000000) {
+            for (int c = 0; c < 2; c++) {
+                adc_select_input(c == 0 ? 0 : 2);        /* GP26 = ADC0, GP28 = ADC2 */
+                uint32_t v = adc_read();
+                if (v < mn[c]) mn[c] = v;
+                if (v > mx[c]) mx[c] = v;
+                sm[c] += v;
+            }
+            n++;
+        }
+        const char *nm[2] = {"GP26 reset", "GP28 POST "};
+        for (int c = 0; c < 2; c++)
+            printf("%s: min %4lu mV  max %4lu mV  avg %4lu mV\n", nm[c],
+                   (unsigned long)(mn[c] * 3300 / 4095), (unsigned long)(mx[c] * 3300 / 4095),
+                   (unsigned long)((sm[c] / n) * 3300 / 4095));
+        printf("(%lu samples/pin; ADC is +-~50 mV. A digital input needs ~2000 mV to read HIGH.)\n", (unsigned long)n);
+        /* restore the normal digital pin setup */
+        gpio_init(CPU_RESET); gpio_set_dir(CPU_RESET, GPIO_IN); gpio_disable_pulls(CPU_RESET);
+        gpio_init(POST_PIN);  gpio_set_dir(POST_PIN, GPIO_IN);
+        gpio_set_input_enabled(POST_PIN, true);
+        gpio_set_pulls(POST_PIN, false, true);
     } else if (!strcmp(cmd, "sweep")) {
         char *a = strtok(NULL, " \t");
         char *b = strtok(NULL, " \t");
