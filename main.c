@@ -226,7 +226,11 @@ static volatile uint32_t sweep_landed_val = 0;
 #define ADC_HIST_N        8
 #define ADC_DEFAULT_SECS  8
 
-static uint16_t g_adc_buf[ADC_BUF_SAMPLES];
+/* MUST be aligned to its own size: the DMA ring wrap only masks the low
+ * ADC_RING_BITS of the address, so if this buffer isn't naturally aligned to
+ * ADC_BUF_BYTES, the wrap point won't line up with the buffer's start and
+ * writes can land outside it. */
+static uint16_t g_adc_buf[ADC_BUF_SAMPLES] __attribute__((aligned(ADC_BUF_BYTES)));
 
 typedef struct {
     bool     post_edge;    /* saw a LOW->HIGH POST transition this run */
