@@ -34,6 +34,8 @@ target_link_libraries(${PROJECT_NAME}
     hardware_pio
     hardware_flash
     hardware_sync
+    hardware_adc
+    hardware_dma
 )
 
 # Serial console lives on USB CDC; UART off.
