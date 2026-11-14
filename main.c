@@ -246,6 +246,12 @@ typedef struct {
     bool     rst_toggled;
 } adc_hist_t;
 
+#define ADC_EDGE_MAX 80
+static uint32_t g_e_us[2][ADC_EDGE_MAX];   /* [0]=POST, [1]=reset-sense */
+static uint8_t  g_e_hi[2][ADC_EDGE_MAX];
+static uint32_t g_e_n[2];
+static uint16_t g_raw_min[2], g_raw_max[2];
+
 static adc_hist_t g_adc_hist[ADC_HIST_N];
 static uint32_t   g_adc_hist_n = 0;
 
@@ -319,8 +325,11 @@ static void cmd_adcmon(uint32_t secs)
     dma_channel_configure(dma_chan, &cfg, g_adc_buf, &adc_hw->fifo, 0xFFFFFFFFu, false);
 
     adc_fifo_drain();
+    dma_channel_start(dma_chan);     /* DMA first, so no early sample is lost and parity holds */
     adc_run(true);
-    dma_channel_start(dma_chan);
+    g_e_n[0] = g_e_n[1] = 0;
+    g_raw_min[0] = g_raw_min[1] = 0xFFFF; g_raw_max[0] = g_raw_max[1] = 0;
+    bool hs[2] = {false, false}, hinit[2] = {false, false};
 
     const uint32_t mask = ADC_BUF_SAMPLES - 1;
     uint32_t last_idx = 0;
@@ -339,6 +348,18 @@ static void cmd_adcmon(uint32_t secs)
             uint16_t raw = g_adc_buf[idx] & 0x0FFFu;
             uint32_t tus = (uint32_t)((total_raw + i) * ADC_SAMPLE_US);
             bool is_post = (((total_raw + i) & 1u) == 0);  /* round robin: even=ch2, odd=ch3 */
+            {   /* full edge list with hysteresis + min/max, for repeatability analysis */
+                uint32_t c = is_post ? 0 : 1;
+                uint32_t hi = is_post ? ADC_POST_THRESH : ADC_RST_THRESH;
+                uint32_t lo = is_post ? 400 : 1400;
+                if (raw < g_raw_min[c]) g_raw_min[c] = raw;
+                if (raw > g_raw_max[c]) g_raw_max[c] = raw;
+                bool ev = false, evhi = false;
+                if (!hinit[c]) { hinit[c] = true; hs[c] = raw > hi; }
+                else if (!hs[c] && raw > hi) { hs[c] = true;  ev = true; evhi = true; }
+                else if (hs[c] && raw < lo)  { hs[c] = false; ev = true; evhi = false; }
+                if (ev && g_e_n[c] < ADC_EDGE_MAX) { g_e_us[c][g_e_n[c]] = tus; g_e_hi[c][g_e_n[c]] = evhi; g_e_n[c]++; }
+            }
             if (is_post) {
                 bool high = raw > ADC_POST_THRESH;
                 if (post_init && high != post_state) {
@@ -401,6 +422,28 @@ static void cmd_adcmon(uint32_t secs)
     printf("  (%s)\n", rst_toggled ? "wire toggled - good" : "DEAD - check this wire");
     printf("\n");
     print_adc_hist();
+
+    /* levels actually seen (3.3V full scale = 4095) */
+    printf("levels: POST min %lu max %lu mV | RST(29) min %lu max %lu mV\n",
+           (unsigned long)(g_raw_min[0] * 3300u / 4095u), (unsigned long)(g_raw_max[0] * 3300u / 4095u),
+           (unsigned long)(g_raw_min[1] * 3300u / 4095u), (unsigned long)(g_raw_max[1] * 3300u / 4095u));
+    const char *nm[2] = {"POST(28)", "RST(29) "};
+    for (int c = 0; c < 2; c++) {
+        printf("%s edges (%lu): ", nm[c], (unsigned long)g_e_n[c]);
+        for (uint32_t k = 0; k < g_e_n[c]; k++)
+            printf("%c%lu.%03lu ", g_e_hi[c][k] ? 'H' : 'L',
+                   (unsigned long)(g_e_us[c][k] / 1000), (unsigned long)(g_e_us[c][k] % 1000));
+        printf("\n");
+    }
+    /* first RST rising edge is the anchor; show every POST edge relative to it (us) */
+    uint32_t anchor = 0; bool have = false;
+    for (uint32_t k = 0; k < g_e_n[1]; k++) if (g_e_hi[1][k]) { anchor = g_e_us[1][k]; have = true; break; }
+    if (have) {
+        printf("POST edges relative to first RST rise (us): ");
+        for (uint32_t k = 0; k < g_e_n[0]; k++)
+            printf("%c%ld ", g_e_hi[0][k] ? 'H' : 'L', (long)g_e_us[0][k] - (long)anchor);
+        printf("\n");
+    }
 }
 
 /* ---- Flash persistence -------------------------------------------------- */
