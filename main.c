@@ -28,6 +28,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <stdint.h>
 
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
@@ -36,6 +37,8 @@
 #include "hardware/pio.h"
 #include "hardware/flash.h"
 #include "hardware/sync.h"
+#include "hardware/adc.h"
+#include "hardware/dma.h"
 #include "glitch.pio.h"
 #include "extclk.pio.h"
 
@@ -194,6 +197,191 @@ static volatile uint32_t sweep_val = 0;
 static volatile uint32_t sweep_tick = 0;         /* bumped each step, for core0 */
 static volatile bool     sweep_landed = false;
 static volatile uint32_t sweep_landed_val = 0;
+
+/* ---- adcmon: ADC/DMA edge-capture diagnostic ----------------------------
+ * Reads POST (GP28 / ADC2) and the 3.3V reset-sense (GP29 / ADC3) as ANALOG
+ * inputs instead of digital GPIO, so a 1.1V POST "high" (which may sit below
+ * the Pico's ~2V digital input threshold) can still be seen and timed.
+ *
+ * This is a one-shot diagnostic, run once per power-cycle (same workflow as
+ * 'mon'): it takes over GP28/GP29 for its capture window, then hands them
+ * back to core1 as plain digital inputs. Because core1's glitch loop also
+ * reads those same two pins, core1 is paused (multicore_lockout) for the
+ * whole window so it never sees them mid-reconfiguration.
+ *
+ * Sampling: round-robin ADC across channels 2 and 3 at full speed (clkdiv 0),
+ * 96 cycles/conversion @ 48 MHz = exactly 2us/sample, so each channel is
+ * re-sampled every 4us. A DMA channel streams the ADC FIFO into a small
+ * power-of-two ring buffer in SRAM (hardware address wrap via
+ * channel_config_set_ring); core0 polls the DMA write pointer and walks any
+ * newly-written samples, classifying every raw sample by parity (round robin
+ * always starts on channel 2, so even samples are POST, odd are reset-sense)
+ * and looking for the first LOW->HIGH crossing on each channel. */
+#define ADC_BUF_SAMPLES   4096                      /* power of two */
+#define ADC_BUF_BYTES     (ADC_BUF_SAMPLES * 2)
+#define ADC_RING_BITS     13                        /* log2(ADC_BUF_BYTES) */
+#define ADC_SAMPLE_US     2                          /* exact @ clkdiv 0, 96 cyc/conv, 48MHz */
+#define ADC_POST_THRESH   700    /* ~1.1V POST high reads ~1365/4095; threshold well above 0 */
+#define ADC_RST_THRESH    2048   /* 3.3V logic; mid-scale */
+#define ADC_HIST_N        8
+#define ADC_DEFAULT_SECS  8
+
+static uint16_t g_adc_buf[ADC_BUF_SAMPLES];
+
+typedef struct {
+    bool     post_edge;    /* saw a LOW->HIGH POST transition this run */
+    uint32_t post_us;      /* time of that edge, us from start of capture */
+    bool     post_toggled; /* POST changed state at all (wire-good check) */
+    bool     rst_edge;
+    uint32_t rst_us;
+    bool     rst_toggled;
+} adc_hist_t;
+
+static adc_hist_t g_adc_hist[ADC_HIST_N];
+static uint32_t   g_adc_hist_n = 0;
+
+static void print_adc_hist(void)
+{
+    if (g_adc_hist_n == 0) { printf("no adcmon runs yet\n"); return; }
+    uint32_t n = g_adc_hist_n, from = n > ADC_HIST_N ? n - ADC_HIST_N : 0;
+    uint32_t pmin = 0, pmax = 0, rmin = 0, rmax = 0; bool pfirst = true, rfirst = true;
+    printf("run   POST-edge(ms)   RST-edge(ms)    POST-wire  RST-wire\n");
+    for (uint32_t k = from; k < n; k++) {
+        adc_hist_t *h = &g_adc_hist[k % ADC_HIST_N];
+        if (h->post_edge) {
+            printf("#%-4lu %-16lu.%03lu ", (unsigned long)(k + 1),
+                   (unsigned long)(h->post_us / 1000), (unsigned long)(h->post_us % 1000));
+        } else {
+            printf("#%-4lu %-16s ", (unsigned long)(k + 1), "no edge");
+        }
+        if (h->rst_edge) {
+            printf("%-15lu.%03lu ", (unsigned long)(h->rst_us / 1000), (unsigned long)(h->rst_us % 1000));
+        } else {
+            printf("%-15s ", "no edge");
+        }
+        printf("%-10s %s\n", h->post_toggled ? "ok" : "DEAD", h->rst_toggled ? "ok" : "DEAD");
+        if (h->post_edge) {
+            if (pfirst || h->post_us < pmin) pmin = h->post_us;
+            if (pfirst || h->post_us > pmax) pmax = h->post_us;
+            pfirst = false;
+        }
+        if (h->rst_edge) {
+            if (rfirst || h->rst_us < rmin) rmin = h->rst_us;
+            if (rfirst || h->rst_us > rmax) rmax = h->rst_us;
+            rfirst = false;
+        }
+    }
+    if (!pfirst)
+        printf("POST edge spread over these runs: %lu us (min %lu.%03lu ms, max %lu.%03lu ms)\n",
+               (unsigned long)(pmax - pmin), (unsigned long)(pmin / 1000), (unsigned long)(pmin % 1000),
+               (unsigned long)(pmax / 1000), (unsigned long)(pmax % 1000));
+    if (!rfirst)
+        printf("RST  edge spread over these runs: %lu us (min %lu.%03lu ms, max %lu.%03lu ms)\n",
+               (unsigned long)(rmax - rmin), (unsigned long)(rmin / 1000), (unsigned long)(rmin % 1000),
+               (unsigned long)(rmax / 1000), (unsigned long)(rmax % 1000));
+}
+
+static void cmd_adcmon(uint32_t secs)
+{
+    printf("adcmon: capturing POST(28)/RESET_SENSE(29) as ANALOG for %lus.\n",
+           (unsigned long)secs);
+    printf("Power the console OFF now, start it, and let it run through this window.\n");
+    printf("(pausing the glitch loop for the capture - this is expected)\n");
+
+    multicore_lockout_start_blocking();   /* core1 must not touch GP28/29 mid-reconfig */
+
+    adc_init();
+    adc_gpio_init(POST_PIN);     /* GP28 -> ADC2 */
+    adc_gpio_init(RESET_SENSE);  /* GP29 -> ADC3 */
+    adc_select_input(2);                         /* round robin starts here: POST first */
+    adc_set_round_robin((1u << 2) | (1u << 3));
+    adc_fifo_setup(true, true, 1, false, false); /* fifo on, DREQ on, thresh 1, no err, no shift */
+    adc_set_clkdiv(0);                           /* full speed: 2us/sample */
+
+    int dma_chan = dma_claim_unused_channel(true);
+    dma_channel_config cfg = dma_channel_get_default_config(dma_chan);
+    channel_config_set_transfer_data_size(&cfg, DMA_SIZE_16);
+    channel_config_set_read_increment(&cfg, false);
+    channel_config_set_write_increment(&cfg, true);
+    channel_config_set_dreq(&cfg, DREQ_ADC);
+    channel_config_set_ring(&cfg, true, ADC_RING_BITS);   /* wrap the write address in SRAM */
+    dma_channel_configure(dma_chan, &cfg, g_adc_buf, &adc_hw->fifo, 0xFFFFFFFFu, false);
+
+    adc_fifo_drain();
+    adc_run(true);
+    dma_channel_start(dma_chan);
+
+    const uint32_t mask = ADC_BUF_SAMPLES - 1;
+    uint32_t last_idx = 0;
+    uint64_t total_raw = 0;
+    bool post_state = false, rst_state = false, post_init = false, rst_init = false;
+    bool post_edge = false, rst_edge = false, post_toggled = false, rst_toggled = false;
+    uint32_t post_edge_us = 0, rst_edge_us = 0;
+
+    absolute_time_t t_end = make_timeout_time_ms(secs * 1000);
+    while (absolute_time_diff_us(get_absolute_time(), t_end) > 0) {
+        uint32_t wa = dma_hw->ch[dma_chan].write_addr;
+        uint32_t cur_idx = (uint32_t)((wa - (uintptr_t)g_adc_buf) / 2) & mask;
+        uint32_t new_count = (cur_idx - last_idx) & mask;
+        for (uint32_t i = 0; i < new_count; i++) {
+            uint32_t idx = (last_idx + i) & mask;
+            uint16_t raw = g_adc_buf[idx] & 0x0FFFu;
+            uint32_t tus = (uint32_t)((total_raw + i) * ADC_SAMPLE_US);
+            bool is_post = (((total_raw + i) & 1u) == 0);  /* round robin: even=ch2, odd=ch3 */
+            if (is_post) {
+                bool high = raw > ADC_POST_THRESH;
+                if (post_init && high != post_state) {
+                    post_toggled = true;
+                    if (high && !post_edge) { post_edge = true; post_edge_us = tus; }
+                }
+                post_state = high; post_init = true;
+            } else {
+                bool high = raw > ADC_RST_THRESH;
+                if (rst_init && high != rst_state) {
+                    rst_toggled = true;
+                    if (high && !rst_edge) { rst_edge = true; rst_edge_us = tus; }
+                }
+                rst_state = high; rst_init = true;
+            }
+        }
+        total_raw += new_count;
+        last_idx = cur_idx;
+        sleep_ms(1);   /* buffer wraps every ~8.2ms; 1ms polling keeps us well ahead of that */
+    }
+
+    dma_channel_abort(dma_chan);
+    adc_run(false);
+    adc_fifo_drain();
+    adc_set_round_robin(0);
+    dma_channel_unclaim(dma_chan);
+
+    /* Hand GP28/29 back to core1 as plain digital inputs, matching main()'s
+     * original POST_PIN setup (pull-down) - core1 re-inits RESET_SENSE itself
+     * every attempt, but POST_PIN is only set up once at boot, so redo it here. */
+    gpio_set_function(POST_PIN, GPIO_FUNC_SIO);
+    gpio_set_input_enabled(POST_PIN, true);
+    gpio_set_dir(POST_PIN, GPIO_IN);
+    gpio_set_pulls(POST_PIN, false, true);
+    gpio_set_function(RESET_SENSE, GPIO_FUNC_SIO);
+    gpio_set_input_enabled(RESET_SENSE, true);
+    gpio_set_dir(RESET_SENSE, GPIO_IN);
+
+    multicore_lockout_end_blocking();
+
+    adc_hist_t *h = &g_adc_hist[g_adc_hist_n % ADC_HIST_N];
+    h->post_edge = post_edge; h->post_us = post_edge_us; h->post_toggled = post_toggled;
+    h->rst_edge  = rst_edge;  h->rst_us  = rst_edge_us;  h->rst_toggled  = rst_toggled;
+    g_adc_hist_n++;
+
+    printf("POST(28):  %s", post_edge ? "edge seen" : "no LOW->HIGH edge seen");
+    if (post_edge) printf(" @ %lu.%03lu ms", (unsigned long)(post_edge_us / 1000), (unsigned long)(post_edge_us % 1000));
+    printf("  (%s)\n", post_toggled ? "wire toggled - good" : "DEAD - check this wire");
+    printf("RST (29):  %s", rst_edge ? "edge seen" : "no LOW->HIGH edge seen");
+    if (rst_edge) printf(" @ %lu.%03lu ms", (unsigned long)(rst_edge_us / 1000), (unsigned long)(rst_edge_us % 1000));
+    printf("  (%s)\n", rst_toggled ? "wire toggled - good" : "DEAD - check this wire");
+    printf("\n");
+    print_adc_hist();
+}
 
 /* ---- Flash persistence -------------------------------------------------- */
 
@@ -552,6 +740,10 @@ static void print_help(void)
         "  bootedges [n]        POST edges needed to count as a real boot (default 3)\n"
         "  attempts             reset the attempt counter\n"
         "  mon                  watch CPU_RESET/POST live for 6s (power-cycle to test)\n"
+        "  adcmon [secs]        ADC-capture POST(28)/RESET_SENSE(29), default 8s\n"
+        "                       (sees sub-2V POST highs digital 'mon' may miss; one\n"
+        "                       power-cycle per run, keeps last 8 in a history table)\n"
+        "  adchist              reprint the adcmon history without a new capture\n"
         "  sweep <i> <a> <b> [s] auto-step timing i from a to b until it boots\n"
         "  sweepstop            cancel an active sweep\n"
         "timing index: 0 post_count  1 delay_to_pll  2 delay_to_rst\n"
@@ -656,6 +848,13 @@ static void handle_line(char *line)
         printf("POST(28):      %s\n",
                (ph && pl) ? "TOGGLED  (seen high & low - wire good)" :
                (ph ? "always HIGH (stuck)" : "always LOW  (no POST - check this wire)"));
+    } else if (!strcmp(cmd, "adcmon")) {
+        char *a = strtok(NULL, " \t");
+        uint32_t secs = a ? (uint32_t)strtoul(a, NULL, 0) : ADC_DEFAULT_SECS;
+        if (secs == 0) secs = ADC_DEFAULT_SECS;
+        cmd_adcmon(secs);
+    } else if (!strcmp(cmd, "adchist")) {
+        print_adc_hist();
     } else if (!strcmp(cmd, "sweep")) {
         char *a = strtok(NULL, " \t");
         char *b = strtok(NULL, " \t");
