@@ -198,6 +198,11 @@ static volatile uint32_t sweep_tick = 0;         /* bumped each step, for core0 
 static volatile bool     sweep_landed = false;
 static volatile uint32_t sweep_landed_val = 0;
 
+/* Set when a sweep lands a boot: core1 stops attempting further glitches so a
+ * console that just came up stays up, instead of being re-glitched forever.
+ * Cleared by starting a new sweep, switching profiles, or 'resume'. */
+static volatile bool     g_halt = false;
+
 /* ---- adcmon: ADC/DMA edge-capture diagnostic ----------------------------
  * Reads POST (GP28 / ADC2) and the 3.3V reset-sense (GP29 / ADC3) as ANALOG
  * inputs instead of digital GPIO, so a 1.1V POST "high" (which may sit below
@@ -648,6 +653,7 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
             sweep_landed_val = sweep_val;
             sweep_landed = true;
             sweep_active = false;
+            g_halt = true;      /* stay off the console now that it has booted */
         } else {
             int64_t nv = (int64_t)sweep_val + (int64_t)sweep_step;
             if ((sweep_step > 0 && nv > (int64_t)sweep_end) ||
@@ -696,6 +702,15 @@ static void core1_main(void)
             }
             offset = pio_add_program(pio, eng_prog(eng));
             loaded = eng;
+        }
+        if (g_halt) {
+            /* A landed sweep already left the LED on solid green; just keep
+             * it alive (lets a red/green timeout run its course, and still
+             * lets core0 pause us for 'save'/'adcmon') without touching the
+             * console at all until the user types 'resume' or starts a new
+             * sweep/profile. */
+            led_tick();
+            continue;
         }
         run_glitch_once(pio, sm, offset, m);
     }
@@ -760,6 +775,9 @@ static void print_help(void)
         "                       power-cycle per run, keeps last 8 in a history table)\n"
         "  adchist              reprint the adcmon history without a new capture\n"
         "  sweep <i> <a> <b> [s] auto-step timing i from a to b until it boots\n"
+        "                       (stops attempting once it lands - console stays\n"
+        "                       booted; 'resume' or a new sweep/use starts again)\n"
+        "  resume               clear a landed-sweep halt and resume attempts\n"
         "  sweepstop            cancel an active sweep\n"
         "timing index: 0 post_count  1 delay_to_pll  2 delay_to_rst\n"
         "              3 glitch_width 4 pll_hold\n");
@@ -799,6 +817,7 @@ static void handle_line(char *line)
         int i = a ? find_profile(a) : -1;
         if (i < 0) { printf("err: use <name|idx>\n"); return; }
         g_cfg.active = (uint32_t)i;
+        g_halt = false;
         printf("active -> %s (unsaved; 'save' to persist)\n", g_cfg.profiles[i].name);
     } else if (!strcmp(cmd, "set")) {
         char *a = strtok(NULL, " \t");
@@ -893,9 +912,17 @@ static void handle_line(char *line)
         sweep_tick = 0;
         sweep_landed = false;
         sweep_active = true;
+        g_halt = false;
         printf("sweeping %s from %lu to %lu step %ld\n", tname(g_cfg.profiles[g_cfg.active].method, idx),
                (unsigned long)s, (unsigned long)e, (long)st);
         printf("power-cycle the console; it steps each miss until it boots.\n");
+    } else if (!strcmp(cmd, "resume")) {
+        if (g_halt) {
+            g_halt = false;
+            printf("resuming glitch attempts.\n");
+        } else {
+            printf("not halted.\n");
+        }
     } else if (!strcmp(cmd, "sweepstop")) {
         sweep_active = false;
         printf("sweep stopped at %s=%lu ('save' to keep).\n",
