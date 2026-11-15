@@ -162,10 +162,10 @@ static const config_t DEFAULT_CONFIG = {
         /* EXT_CLK seeds from Octal450's Zephyr VHDL @192MHz: r_end 118008,
          * pulse 2, slow_delay ~382ms (73,344,000 cyc), T_BUF 50000, ~12 pulses.
          * These are STRUCTURAL SEEDS - must be dialed in on hardware. */
-        { "zephyr",  METHOD_EXTCLK, { 12, 73344000, 118008, 2, 50000 } },     /* dial in */
+        { "zephyr",  METHOD_EXTCLK, { 12, 73344000, 28300, 2, 50000 } },        /* r_end = STBY_CLK periods now; dial in */
         /* Xenon: same EXT_CLK engine; Octal450's VHDL differs from Zephyr only in
          * R_END (118002 vs 118008 @192MHz). Untested - seed, dial in with sweep. */
-        { "xenon",   METHOD_EXTCLK, { 12, 73344000, 118002, 2, 50000 } },     /* dial in */
+        { "xenon",   METHOD_EXTCLK, { 12, 73344000, 28300, 2, 50000 } },        /* r_end = STBY_CLK periods now; dial in */
     },
 };
 
@@ -574,6 +574,12 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
         pio_sm_set_pindirs_with_mask(pio, sm, (1u << PLL_BYPASS),
                                      (1u << CPU_RESET) | (1u << PLL_BYPASS));
     }
+
+    /* EXT_CLK reads POST through a fast diode (GP28 anode -> FT6U1 cathode); the
+     * internal pull-up is what makes that diode level-shift the 1.1V POST into a
+     * clean 0.6/1.7V digital swing the PIO can read. RGH 1.2 (driven) reads POST
+     * bare, so only pull up for EXT_CLK. */
+    if (!driven) gpio_pull_up(POST_PIN); else gpio_disable_pulls(POST_PIN);
 
     pio_sm_init(pio, sm, offset, &c);
     pio_sm_set_enabled(pio, sm, true);
