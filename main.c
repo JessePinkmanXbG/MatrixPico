@@ -41,6 +41,7 @@
 #include "hardware/dma.h"
 #include "glitch.pio.h"
 #include "extclk.pio.h"
+#include "extclk_sw.pio.h"
 
 /* Status LED. The RP2040-Zero's onboard RGB is a WS2812 on GP16; a classic
  * Pico has a plain LED on GP25. Set USE_WS2812 to match your board. */
@@ -227,7 +228,39 @@ static volatile bool     g_halt = false;
 #define ADC_RING_BITS     13                        /* log2(ADC_BUF_BYTES) */
 #define ADC_SAMPLE_US     2                          /* exact @ clkdiv 0, 96 cyc/conv, 48MHz */
 #define ADC_POST_THRESH   700    /* ~1.1V POST high reads ~1365/4095; threshold well above 0 */
+#define ADC_POST_LO       400    /* hysteresis low side, ~320mV */
 #define ADC_RST_THRESH    2048   /* 3.3V logic; mid-scale */
+
+/* POST is read through the ADC for EXT_CLK (see extclk_sw.pio) instead of as
+ * a digital pin - the net never reaches the RP2040's input threshold. This
+ * tracks which mode POST_PIN is currently in, since Trinity (RGH 1.2) still
+ * needs it back as a plain digital input. */
+static bool g_post_is_adc = false;
+
+static void post_pin_to_adc(void)
+{
+    if (g_post_is_adc) return;
+    adc_init();
+    adc_gpio_init(POST_PIN);
+    g_post_is_adc = true;
+}
+
+static void post_pin_to_digital(void)
+{
+    if (!g_post_is_adc) return;
+    gpio_set_function(POST_PIN, GPIO_FUNC_SIO);
+    gpio_set_input_enabled(POST_PIN, true);
+    gpio_set_dir(POST_PIN, GPIO_IN);
+    gpio_set_pulls(POST_PIN, false, true);
+    g_post_is_adc = false;
+}
+
+/* Single ADC sample of POST, channel 2 (GP28). ~2us per call. */
+static inline uint16_t adc_read_post(void)
+{
+    adc_select_input(2);
+    return adc_read();
+}
 #define ADC_HIST_N        8
 #define ADC_DEFAULT_SECS  8
 
@@ -564,7 +597,7 @@ static void led_green_hold(void)               /* confirmed boot: solid green 5s
 
 static const pio_program_t *eng_prog(int e)
 {
-    return (e == 1) ? &extclk_program : &glitch_program;
+    return (e == 1) ? &extclk_sw_program : &glitch_program;
 }
 
 static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
@@ -572,6 +605,8 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
     /* RGH 1.2 uses the original PicoRGH program, which drives CPU_RESET (high
      * between pulses, low for the glitch). EXT_CLK keeps its open-drain engine. */
     const bool driven = (method != METHOD_EXTCLK);
+
+    if (method == METHOD_EXTCLK) post_pin_to_adc(); else post_pin_to_digital();
 
     if (sweep_active)
         g_cfg.profiles[g_cfg.active].t[sweep_idx] = sweep_val;
@@ -588,7 +623,7 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
         led_tick();                       /* lets a red phase time out while we wait */
 
     pio_sm_config c = (method == METHOD_EXTCLK)
-        ? extclk_program_get_default_config(offset)
+        ? extclk_sw_program_get_default_config(offset)
         : glitch_program_get_default_config(offset);
     sm_config_set_set_pins(&c, CPU_RESET, 2);   /* bit0 = RESET, bit1 = PLL/EXTC */
     if (driven) sm_config_set_sideset_pins(&c, CPU_RESET);
@@ -619,28 +654,71 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
     }
 
     pio_sm_init(pio, sm, offset, &c);
-    pio_sm_set_enabled(pio, sm, true);
 
     led_flicker_start();      /* 2.5s fast blue flicker, non-blocking */
-    /* The proven build waited ~200ms here before sending the timing values; keep
-     * that so POST counting starts at exactly the same moment. */
-    { absolute_time_t dl = delayed_by_ms(get_absolute_time(), 204);
-      while (absolute_time_diff_us(get_absolute_time(), dl) > 0) led_tick(); }
 
-    /* Same 5-value feed for both engines (slots mean different things per
-     * method). Reset-low lasts (y + 1) cycles, so pass width-1. */
-    pio_sm_put_blocking(pio, sm, t[0]);                      /* post_count */
-    pio_sm_put_blocking(pio, sm, t[1]);                      /* delay_to_pll / slow_delay */
-    pio_sm_put_blocking(pio, sm, t[2]);                      /* delay_to_rst / r_end */
-    pio_sm_put_blocking(pio, sm, driven ? t[3] : (t[3] > 0 ? t[3] - 1 : 0));   /* glitch_width / pulse_width */
-    pio_sm_put_blocking(pio, sm, t[4]);                      /* pll_hold / extc_hold */
+    if (driven) {
+        pio_sm_set_enabled(pio, sm, true);
+        /* The proven build waited ~200ms here before sending the timing values; keep
+         * that so POST counting starts at exactly the same moment. */
+        { absolute_time_t dl = delayed_by_ms(get_absolute_time(), 204);
+          while (absolute_time_diff_us(get_absolute_time(), dl) > 0) led_tick(); }
 
-    while (pio_sm_is_rx_fifo_empty(pio, sm))
-        led_tick();
-    pio_sm_get_blocking(pio, sm);         /* glitch complete */
+        pio_sm_put_blocking(pio, sm, t[0]);                      /* post_count */
+        pio_sm_put_blocking(pio, sm, t[1]);                      /* delay_to_pll */
+        pio_sm_put_blocking(pio, sm, t[2]);                      /* delay_to_rst */
+        pio_sm_put_blocking(pio, sm, t[3]);                      /* glitch_width */
+        pio_sm_put_blocking(pio, sm, t[4]);                      /* pll_hold */
 
-    pio_sm_set_enabled(pio, sm, false);
-    pio_sm_restart(pio, sm);
+        while (pio_sm_is_rx_fifo_empty(pio, sm))
+            led_tick();
+        pio_sm_get_blocking(pio, sm);         /* glitch complete */
+
+        pio_sm_set_enabled(pio, sm, false);
+        pio_sm_restart(pio, sm);
+    } else {
+        /* EXT_CLK: post_count and slow_delay happen here in software, via the
+         * ADC, because the PIO can never see this POST level digitally. The
+         * SM stays disabled (sitting at its first instruction) until we've
+         * done both and are ready to fire - at that point EXT_CLK_EN, r_end,
+         * the pulse, and extc_hold all run in hardware same as before. */
+        bool got_post = false;
+        {
+            bool init = false, high = false;
+            uint32_t cnt = 0;
+            absolute_time_t deadline = delayed_by_ms(get_absolute_time(), 3000);
+            while (absolute_time_diff_us(get_absolute_time(), deadline) > 0) {
+                uint16_t raw = adc_read_post();
+                if (!init) { init = true; high = raw > ADC_POST_THRESH; }
+                else if (!high && raw > ADC_POST_THRESH) {
+                    high = true; cnt++;
+                    if (cnt >= t[0]) { got_post = true; break; }
+                } else if (high && raw < ADC_POST_LO) { high = false; }
+                led_tick();
+            }
+        }
+        if (got_post) {
+            uint32_t freq = clock_get_hz(clk_sys);
+            uint64_t slow_us = ((uint64_t)t[1] * 1000000ULL) / freq;
+            absolute_time_t dl2 = delayed_by_us(get_absolute_time(), slow_us);
+            while (absolute_time_diff_us(get_absolute_time(), dl2) > 0) led_tick();
+
+            pio_sm_put_blocking(pio, sm, t[2]);                        /* r_end */
+            pio_sm_put_blocking(pio, sm, t[3] > 0 ? t[3] - 1 : 0);      /* pulse_width - 1 */
+            pio_sm_put_blocking(pio, sm, t[4]);                        /* extc_hold */
+            pio_sm_set_enabled(pio, sm, true);
+
+            while (pio_sm_is_rx_fifo_empty(pio, sm))
+                led_tick();
+            pio_sm_get_blocking(pio, sm);         /* glitch complete */
+
+            pio_sm_set_enabled(pio, sm, false);
+            pio_sm_restart(pio, sm);
+        }
+        /* !got_post: no POST edges seen in 3s - console likely not powered up
+         * yet. No pulse fires this attempt; falls through to the boot-judge
+         * loop below, which will correctly read it as a miss. */
+    }
 
     gpio_init(arm_pin);
     gpio_set_dir(arm_pin, GPIO_IN);
@@ -657,9 +735,15 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
     bool booted = false;
     bool red_done = false;
     uint32_t edges = 0;
-    bool lastp = gpio_get(POST_PIN);
+    bool lastp = driven ? gpio_get(POST_PIN) : (adc_read_post() > ADC_POST_THRESH);
     while (gpio_get(arm_pin)) {
-        bool p = gpio_get(POST_PIN);
+        bool p = driven ? gpio_get(POST_PIN) : lastp;
+        if (!driven) {
+            uint16_t raw = adc_read_post();
+            if (!lastp && raw > ADC_POST_THRESH) p = true;
+            else if (lastp && raw < ADC_POST_LO) p = false;
+            else p = lastp;
+        }
         if (p != lastp) { edges++; lastp = p; hh->etot = edges; }
         led_tick();
         /* Green as soon as the POST edges prove a boot - but never before the 2.5s

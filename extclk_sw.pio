@@ -1,0 +1,48 @@
+; Matrix Pico EXT_CLK "software-anchored" engine (ADC-based POST detection)
+;
+; POST on this board measures ~1.1-1.2V (adcmon), well under the RP2040's
+; digital input threshold (~1.6-2.0V). A `wait 1 gpio 28` instruction can
+; never reliably see that, so this program drops POST counting and the
+; slow_delay wait from the PIO entirely. core1 does both in software instead,
+; reading POST through the ADC (polled, not cycle-exact) before it ever
+; starts this state machine. By the time this program runs, EXT_CLK_EN raises
+; immediately and everything that still needs real precision - r_end, the
+; glitch pulse itself, extc_hold - stays in hardware at full PIO cycle
+; accuracy. Only "when do we start" moved to software, which is the one
+; decision that genuinely can't stay cycle-exact given the signal level.
+; See docs/ZEPHYR_EXTCLK.md.
+;
+; SET pins (base = CPU_RESET, count = 2):
+;   bit 0 = CPU_RESET  (stays input/floating until the glitch; open-drain,
+;                       never driven high - same rule as extclk.pio)
+;   bit 1 = EXT_CLK_EN (push-pull output)
+;
+; The C side pushes 3 values right before enabling this SM: r_end,
+; pulse_width-1, extc_hold. post_count and slow_delay are consumed in
+; software and never reach this program.
+
+.program extclk_sw
+
+	set pins, 0b10               ; EXT_CLK_EN HIGH the instant this SM starts
+
+	pull block                    ; x = r_end
+	mov x, osr
+	pull block                    ; y = pulse_width - 1
+	mov y, osr
+
+rend_delay:
+	jmp x-- rend_delay
+
+	set pindirs, 0b11            ; reset -> output -> LOW (glitch); EXT_CLK_EN stays high
+hold_rst:
+	jmp y-- hold_rst
+
+	set pindirs, 0b10            ; reset -> input -> FLOAT (open-drain release, no 3.3V)
+
+	pull block                    ; x = extc_hold
+	mov x, osr
+hold_extc:
+	jmp x-- hold_extc
+
+	set pins, 0b00               ; EXT_CLK_EN LOW
+	push block
