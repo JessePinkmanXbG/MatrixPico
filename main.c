@@ -39,6 +39,7 @@
 #include "hardware/sync.h"
 #include "hardware/adc.h"
 #include "hardware/dma.h"
+#include "hardware/pwm.h"
 #include "glitch.pio.h"
 #include "extclk.pio.h"
 
@@ -71,6 +72,70 @@
 #define PLL_BYPASS  27   /* RGH 1.2: CPU_PLL_BYPASS.  EXT_CLK: CPU_EXT_CLK_EN (same pin) */
 #define POST_PIN    28
 #define RESET_SENSE 29   /* EXT_CLK only: arm-sense on a 3.3V reset point (reset OUT is 1.1V) */
+
+/* ---- STBY_CLK frequency counter -----------------------------------------
+ * Measures a clock on `pin` using a hardware PWM slice in rising-edge count
+ * mode (the clean way to count a signal too fast for a software loop). Reports
+ * the frequency and whether the PIO, clocked from this RP2040's sys clock, can
+ * track it edge-by-edge - the gate for doing real EXT_CLK on a Pico.
+ * pin must be ODD (PWM B channel does the edge counting). STBY_CLK is 3v3
+ * (LVCMOS33 on the Matrix) so it reads on a normal 3v3 GPIO; a count near 0
+ * means the wire is wrong or the level is too low to read. */
+static void cmd_stbyclk(uint32_t pin)
+{
+    if ((pin & 1u) == 0) { printf("stbyclk: pin %lu must be ODD (PWM-B edge counter)\n", (unsigned long)pin); return; }
+    uint32_t sysmhz = clock_get_hz(clk_sys) / 1000000u;
+    printf("stbyclk: counting edges on GP%lu for ~3s (sys clk %lu MHz).\n", (unsigned long)pin, (unsigned long)sysmhz);
+    printf("Power the console ON and leave it running through the window.\n");
+
+    gpio_set_function(pin, GPIO_FUNC_PWM);
+    uint slice = pwm_gpio_to_slice_num(pin);
+    pwm_config cfg = pwm_get_default_config();
+    pwm_config_set_clkdiv_mode(&cfg, PWM_DIV_B_RISING);   /* count rising edges on the B pin */
+    pwm_init(slice, &cfg, false);
+
+    const uint32_t gate_us = 200;        /* 200us window: no 16-bit wrap below ~327 MHz */
+    uint32_t fmin = 0xFFFFFFFF, fmax = 0, nz = 0;
+    uint64_t fsum = 0;
+    const int N = 15;
+    for (int i = 0; i < N; i++) {
+        pwm_set_counter(slice, 0);
+        pwm_set_enabled(slice, true);
+        busy_wait_us(gate_us);
+        pwm_set_enabled(slice, false);
+        uint32_t cnt = pwm_get_counter(slice);
+        uint32_t fk = (cnt * 1000u) / gate_us;      /* kHz: cnt edges in gate_us us */
+        if (cnt >= 65000u) printf("  window %2d: %lu edges (!! near 16-bit wrap - signal may be >300MHz)\n", i, (unsigned long)cnt);
+        if (cnt > 0) { nz++; fsum += fk; if (fk < fmin) fmin = fk; if (fk > fmax) fmax = fk; }
+        busy_wait_us(1000);
+    }
+    gpio_set_function(pin, GPIO_FUNC_SIO);
+    gpio_set_dir(pin, GPIO_IN);
+
+    if (nz == 0) {
+        printf("result: NO EDGES on GP%lu. Either the wire isn't on STBY_CLK, the console\n", (unsigned long)pin);
+        printf("        is off, or the level is too low for a 3v3 input. Check the wire.\n");
+        return;
+    }
+    uint32_t favg = (uint32_t)(fsum / nz);
+    printf("result: ~%lu.%03lu MHz  (windows with signal: %d/%d, min %lu.%03lu, max %lu.%03lu MHz)\n",
+           (unsigned long)(favg/1000), (unsigned long)(favg%1000), nz, N,
+           (unsigned long)(fmin/1000),(unsigned long)(fmin%1000),(unsigned long)(fmax/1000),(unsigned long)(fmax%1000));
+    uint32_t spread = fmax - fmin;
+    printf("        stability spread: %lu.%03lu MHz %s\n",
+           (unsigned long)(spread/1000),(unsigned long)(spread%1000),
+           spread < 500 ? "(steady - good)" : "(jittery - note this)");
+    /* PIO trackability: PIO instr run at sys clk; need several per STBY_CLK period */
+    if (favg > 0) {
+        uint32_t cyc_x100 = (sysmhz * 100000u) / favg;   /* PIO cycles per STBY period x100 */
+        printf("        PIO cycles per STBY_CLK period @ %lu MHz sys: %lu.%02lu\n",
+               (unsigned long)sysmhz, (unsigned long)(cyc_x100/100), (unsigned long)(cyc_x100%100));
+        printf("        edge-tracking verdict: %s\n",
+               cyc_x100 >= 600 ? "GOOD (>=6 cycles/period - PIO can lock to it)" :
+               cyc_x100 >= 400 ? "TIGHT (4-6 cycles - possible, needs a lean PIO loop)" :
+                                 "TOO FAST (<4 cycles - can't track by edges at this sys clk)");
+    }
+}
 
 /* Glitch method per profile. */
 #define METHOD_RGH12   0   /* Trinity/Corona/Falcon/Jasper - PLL bypass */
@@ -771,6 +836,7 @@ static void print_help(void)
         "  attempts             reset the attempt counter\n"
         "  mon                  watch CPU_RESET/POST live for 6s (power-cycle to test)\n"
         "  adcmon [secs]        ADC-capture POST(28)/RESET_SENSE(29), default 8s\n"
+        "  stbyclk [pin]        measure STBY_CLK frequency on GP<pin> (default 15, must be odd)\n"
         "                       (sees sub-2V POST highs digital 'mon' may miss; one\n"
         "                       power-cycle per run, keeps last 8 in a history table)\n"
         "  adchist              reprint the adcmon history without a new capture\n"
@@ -882,6 +948,10 @@ static void handle_line(char *line)
         printf("POST(28):      %s\n",
                (ph && pl) ? "TOGGLED  (seen high & low - wire good)" :
                (ph ? "always HIGH (stuck)" : "always LOW  (no POST - check this wire)"));
+    } else if (!strcmp(cmd, "stbyclk")) {
+        char *a = strtok(NULL, " \t");
+        uint32_t pin = a ? (uint32_t)strtoul(a, NULL, 0) : 15;
+        cmd_stbyclk(pin);
     } else if (!strcmp(cmd, "adcmon")) {
         char *a = strtok(NULL, " \t");
         uint32_t secs = a ? (uint32_t)strtoul(a, NULL, 0) : ADC_DEFAULT_SECS;
