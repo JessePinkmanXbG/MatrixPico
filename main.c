@@ -981,6 +981,49 @@ static void handle_line(char *line)
         printf("  POST(28): %s   edges: %lu\n",
                (ph&&pl)?"toggled":(ph?"always HIGH":"always LOW"), (unsigned long)pedges);
         printf("  (compare to 'mon' baseline ~7000ms. BIG change = EXT_CLK_EN works; same = wrong point/polarity)\n");
+    } else if (!strcmp(cmd, "capture")) {
+        /* Pico-as-logic-analyzer: timestamp every POST(28) and RST_SENSE(29) edge
+         * during a boot, engine paused. On a FAILED boot POST advances to the
+         * signature check then stalls, so the last POST edge before the longest
+         * gap = the check, and the edge count to it = the real anchor. Prints the
+         * raw edge list + a summary (total edges, the stall, POST edges before it). */
+        #define CAP_MAX 3000u
+        static uint32_t cap_t[CAP_MAX]; static uint8_t cap_c[CAP_MAX];
+        multicore_lockout_start_blocking();
+        gpio_init(POST_PIN);    gpio_set_dir(POST_PIN, GPIO_IN);    gpio_pull_up(POST_PIN);
+        gpio_init(RESET_SENSE); gpio_set_dir(RESET_SENSE, GPIO_IN);
+        printf("CAPTURE: recording POST/RST_SENSE edges for 12s - power-cycle the console now...\n");
+        uint32_t n=0; bool lp=gpio_get(POST_PIN), ls=gpio_get(RESET_SENSE);
+        uint64_t t0=time_us_64(), tend=t0+12000000ull;
+        while (time_us_64() < tend && n < CAP_MAX) {
+            uint32_t now=(uint32_t)(time_us_64()-t0);
+            bool p=gpio_get(POST_PIN);
+            if (p!=lp){ cap_t[n]=now; cap_c[n]=(p?1u:0u); n++; lp=p; if(n>=CAP_MAX)break; }
+            bool sg=gpio_get(RESET_SENSE);
+            if (sg!=ls){ cap_t[n]=now; cap_c[n]=2u|(sg?1u:0u); ls=sg; n++; }
+        }
+        multicore_lockout_end_blocking();
+        /* summary: POST edge count + longest gap between consecutive POST edges */
+        uint32_t pedges=0, prev_post_t=0; bool have_prev=false;
+        uint32_t gap_max=0, gap_at_idx=0, gap_at_t=0, post_before_gap=0, pc=0;
+        for (uint32_t i=0;i<n;i++){
+            if ((cap_c[i]&2u)==0){ /* POST edge */
+                pc++;
+                if (have_prev){ uint32_t g=cap_t[i]-prev_post_t; if(g>gap_max){gap_max=g; gap_at_idx=i; gap_at_t=prev_post_t; post_before_gap=pc-1;} }
+                prev_post_t=cap_t[i]; have_prev=true; pedges++;
+            }
+        }
+        printf("edges: %lu total, %lu POST\n", (unsigned long)n, (unsigned long)pedges);
+        printf("longest POST gap: %lu.%03lu ms, starting after POST edge #%lu at t=%lu.%03lu ms\n",
+               (unsigned long)(gap_max/1000),(unsigned long)(gap_max%1000),(unsigned long)post_before_gap,
+               (unsigned long)(gap_at_t/1000),(unsigned long)(gap_at_t%1000));
+        printf("  -> that POST edge count (%lu) is the check anchor; in pulses ~ %lu\n",
+               (unsigned long)post_before_gap, (unsigned long)(post_before_gap/2));
+        printf("raw edges (t_ms : signal):\n");
+        for (uint32_t i=0;i<n;i++){
+            const char *nm = (cap_c[i]&2u)?"RST29":"POST ";
+            printf("  %lu.%03lu %s %s\n",(unsigned long)(cap_t[i]/1000),(unsigned long)(cap_t[i]%1000),nm,(cap_c[i]&1u)?"H":"L");
+        }
     } else if (!strcmp(cmd, "mon")) {
         printf("monitoring GP26/GP28/GP29 for 12s - power-cycle the console now...\n");
         gpio_init(RESET_SENSE); gpio_set_dir(RESET_SENSE, GPIO_IN);
