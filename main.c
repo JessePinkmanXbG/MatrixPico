@@ -184,7 +184,7 @@ static hist_t g_hist[16];
 static volatile uint32_t g_hist_n = 0;       /* attempts started since boot */
 static volatile uint32_t g_last_edges = 0;   /* POST edges seen 4s after the last glitch */
 static volatile uint32_t g_boot_edges = 3;   /* (legacy, unused by the boot judge now) */
-#define BOOT_HOLD_MS 8000   /* arm_pin must stay HIGH this long to count as a real boot */
+#define BOOT_HOLD_MS 12000  /* > the ~7s SMC fail-hold we measured, < an infinite boot */
 
 /* Sweep (auto-tune) state, shared core0 <-> core1. When active, core1 applies
  * sweep_val to the active profile's timing[sweep_idx] on each attempt and steps
@@ -873,6 +873,36 @@ static void handle_line(char *line)
     } else if (!strcmp(cmd, "attempts")) {
         g_attempts = 0;
         printf("attempt counter reset.\n");
+    } else if (!strcmp(cmd, "extctest")) {
+        /* Does EXT_CLK_EN actually slow the CPU? Drive GP27 to <level> and watch
+         * how the console behaves vs the ~7s baseline from 'mon'. If EXT_CLK_EN
+         * works, slowing the CPU changes GP29's hold time and POST's rate a lot;
+         * if GP29 still holds ~7s and POST looks normal, the EXT_CLK_EN point or
+         * polarity is wrong and no r_end can ever land. */
+        char *a = strtok(NULL, " \t");
+        uint32_t lvl = a ? (uint32_t)strtoul(a, NULL, 0) : 1;
+        gpio_init(PLL_BYPASS); gpio_set_dir(PLL_BYPASS, GPIO_OUT); gpio_put(PLL_BYPASS, lvl ? 1 : 0);
+        gpio_init(RESET_SENSE); gpio_set_dir(RESET_SENSE, GPIO_IN);
+        printf("EXT_CLK_EN(27) held %s for 20s - power-cycle the console now...\n", lvl ? "HIGH" : "LOW");
+        bool sh=false, sl=false, ph=false, pl=false;
+        uint32_t s_hi_max=0, pedges=0;
+        bool last_s = gpio_get(RESET_SENSE), last_p = gpio_get(POST_PIN);
+        absolute_time_t t0=get_absolute_time(), seg=t0;
+        while (absolute_time_diff_us(t0, get_absolute_time()) < 20000000) {
+            bool sv=gpio_get(RESET_SENSE); if(sv)sh=true; else sl=true;
+            if (sv!=last_s){ if(last_s){uint32_t d=(uint32_t)(absolute_time_diff_us(seg,get_absolute_time())/1000); if(d>s_hi_max)s_hi_max=d;} seg=get_absolute_time(); last_s=sv; }
+            bool pv=gpio_get(POST_PIN); if(pv)ph=true; else pl=true;
+            if (pv!=last_p){ pedges++; last_p=pv; }
+            sleep_us(200);
+        }
+        if (last_s){uint32_t d=(uint32_t)(absolute_time_diff_us(seg,get_absolute_time())/1000); if(d>s_hi_max)s_hi_max=d;}
+        gpio_put(PLL_BYPASS, 0);
+        printf("with EXT_CLK_EN held %s:\n", lvl ? "HIGH" : "LOW");
+        printf("  RST_SENSE(29): %s   longest HIGH: %lu ms\n",
+               (sh&&sl)?"toggled":(sh?"always HIGH":"always LOW"), (unsigned long)s_hi_max);
+        printf("  POST(28): %s   edges: %lu\n",
+               (ph&&pl)?"toggled":(ph?"always HIGH":"always LOW"), (unsigned long)pedges);
+        printf("  (compare to 'mon' baseline ~7000ms. BIG change = EXT_CLK_EN works; same = wrong point/polarity)\n");
     } else if (!strcmp(cmd, "mon")) {
         printf("monitoring GP26/GP28/GP29 for 12s - power-cycle the console now...\n");
         gpio_init(RESET_SENSE); gpio_set_dir(RESET_SENSE, GPIO_IN);
