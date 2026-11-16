@@ -162,10 +162,10 @@ static const config_t DEFAULT_CONFIG = {
         /* EXT_CLK seeds from Octal450's Zephyr VHDL @192MHz: r_end 118008,
          * pulse 2, slow_delay ~382ms (73,344,000 cyc), T_BUF 50000, ~12 pulses.
          * These are STRUCTURAL SEEDS - must be dialed in on hardware. */
-        { "zephyr",  METHOD_EXTCLK, { 12, 73344000, 28300, 2, 50000 } },        /* r_end = STBY_CLK periods now; dial in */
+        { "zephyr",  METHOD_EXTCLK, { 12, 100, 29502, 2, 50000 } },             /* Matrix R_END 118008@192MHz -> 29502@48MHz; EXTC asserts at anchor */
         /* Xenon: same EXT_CLK engine; Octal450's VHDL differs from Zephyr only in
          * R_END (118002 vs 118008 @192MHz). Untested - seed, dial in with sweep. */
-        { "xenon",   METHOD_EXTCLK, { 12, 73344000, 28300, 2, 50000 } },        /* r_end = STBY_CLK periods now; dial in */
+        { "xenon",   METHOD_EXTCLK, { 12, 100, 29501, 2, 50000 } },             /* Matrix R_END 118002@192MHz -> 29501@48MHz */
     },
 };
 
