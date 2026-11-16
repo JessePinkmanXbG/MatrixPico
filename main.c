@@ -881,8 +881,10 @@ static void handle_line(char *line)
          * polarity is wrong and no r_end can ever land. */
         char *a = strtok(NULL, " \t");
         uint32_t lvl = a ? (uint32_t)strtoul(a, NULL, 0) : 1;
+        multicore_lockout_start_blocking();   /* STOP core1 so it can't fight us for GP27 */
         gpio_init(PLL_BYPASS); gpio_set_dir(PLL_BYPASS, GPIO_OUT); gpio_put(PLL_BYPASS, lvl ? 1 : 0);
         gpio_init(RESET_SENSE); gpio_set_dir(RESET_SENSE, GPIO_IN);
+        printf("(engine paused; GP27 held by USB side only)\n");
         printf("EXT_CLK_EN(27) held %s for 20s - power-cycle the console now...\n", lvl ? "HIGH" : "LOW");
         bool sh=false, sl=false, ph=false, pl=false;
         uint32_t s_hi_max=0, pedges=0;
@@ -897,6 +899,7 @@ static void handle_line(char *line)
         }
         if (last_s){uint32_t d=(uint32_t)(absolute_time_diff_us(seg,get_absolute_time())/1000); if(d>s_hi_max)s_hi_max=d;}
         gpio_put(PLL_BYPASS, 0);
+        multicore_lockout_end_blocking();     /* resume core1 */
         printf("with EXT_CLK_EN held %s:\n", lvl ? "HIGH" : "LOW");
         printf("  RST_SENSE(29): %s   longest HIGH: %lu ms\n",
                (sh&&sl)?"toggled":(sh?"always HIGH":"always LOW"), (unsigned long)s_hi_max);
