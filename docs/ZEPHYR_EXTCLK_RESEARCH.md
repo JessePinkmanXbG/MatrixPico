@@ -5,6 +5,18 @@
 
 ---
 
+## Update (session 2) — the likely real bug
+
+- **NAND is ruled out:** the console boots with a real Matrix V3, so bootchain/XeLL/wiring are all proven. This is a firmware/resolution problem, not a prerequisite one.
+- **It was full EXT_CLK, not EXT+3** → `delay_val=4475`, Octal450's Zephyr window `117998–118010` @192 MHz.
+- **The glitch window is only ~3–5 ns wide** (logic-analyzer RE of a real Matrix: POST-anchored timer, reset pulse fired to ~ns precision, 5.208 ns effective resolution). **Our autosweep stepped r_end in 8-unit (~42 ns) jumps — ~10× wider than the window — so we skated over it almost every attempt.** This, not the r_end value, is the most likely reason a *proven* console never booted.
+- **Fix shipped:** `zephyr_dense_autorun.uf2` steps r_end by **1 unit (~5 ns)** across the known-good window, hedges the anchor ±1 pulse, auto-runs with no screen (console-powered), shows status on the LED, and auto-saves the landing. See `docs/WAKE_UP_STEPS.md`.
+- **USB power** (user's question): not the main blocker, but real — a 10 ns pulse wants a short common ground; powering the Pico from the console's 3.3 V standby (like a Matrix) removes the variable.
+
+Updated suspect order: **(1) r_end step resolution vs the 3–5 ns window** ← fixed in this build; (2) POST-edge fidelity / anchor; (3) ground/USB power; (4) anchor offset.
+
+---
+
 ## 0. TL;DR (read this first)
 
 1. **Wiring is correct.** Our four glitch wires (RST, POST, STBY_CLK, EXT_CLK) exactly match the official Matrix EXT_CLK pinout, and 48 MHz STBY_CLK is the documented value. Nothing to change on the solder side.
