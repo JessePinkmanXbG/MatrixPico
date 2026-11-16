@@ -1138,11 +1138,11 @@ static void handle_line(char *line)
         /* 2-D unattended search: anchor (outer) x r_end (inner), fixed ~20ns
          * pulse. Covers both coupled unknowns; stops on a real boot. ~600
          * combos ~ 1 hour. */
-        g_cfg.profiles[g_cfg.active].t[3] = 4;            /* pulse ~20ns */
-        sweep_idx   = 2;                                  /* inner: r_end */
-        sweep_start = 117408; sweep_end = 118608; sweep_step = 8;  /* 29352-29652 STBY periods, 2-period steps */
+        g_cfg.profiles[g_cfg.active].t[3] = 3;            /* pulse ~15ns */
+        sweep_idx   = 2;                                  /* inner: r_end (Matrix /4 units) */
+        sweep_start = 40; sweep_end = 8000; sweep_step = 8;   /* r_end ~10-2000 STBY periods, 2-period steps - the SMALL zone (clock-stop) */
         sweep_val   = sweep_start;
-        g_as_anchor_lo = 10; g_as_anchor_hi = 13;         /* outer: anchor pulses */
+        g_as_anchor_lo = 9; g_as_anchor_hi = 11;          /* outer: anchor pulses around the confirmed ~10 */
         g_extclk_anchor = g_as_anchor_lo;
         g_as_anchor_changed = true;
         sweep_landed = false;
