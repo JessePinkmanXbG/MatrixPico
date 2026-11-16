@@ -874,20 +874,35 @@ static void handle_line(char *line)
         g_attempts = 0;
         printf("attempt counter reset.\n");
     } else if (!strcmp(cmd, "mon")) {
-        printf("monitoring pins for 6s - power-cycle the console now...\n");
-        bool rh = false, rl = false, ph = false, pl = false;
-        absolute_time_t t0 = get_absolute_time();
-        while (absolute_time_diff_us(t0, get_absolute_time()) < 6000000) {
+        printf("monitoring GP26/GP28/GP29 for 12s - power-cycle the console now...\n");
+        gpio_init(RESET_SENSE); gpio_set_dir(RESET_SENSE, GPIO_IN);
+        bool rh=false, rl=false, ph=false, pl=false, sh=false, sl=false;
+        uint32_t s_hi_max=0, s_hi_cur=0;   /* longest continuous GP29-high stretch (ms) */
+        bool last_s = gpio_get(RESET_SENSE);
+        absolute_time_t t0 = get_absolute_time(), seg = t0;
+        while (absolute_time_diff_us(t0, get_absolute_time()) < 12000000) {
             if (gpio_get(CPU_RESET)) rh = true; else rl = true;
             if (gpio_get(POST_PIN))  ph = true; else pl = true;
+            bool s = gpio_get(RESET_SENSE);
+            if (s) sh = true; else sl = true;
+            if (s != last_s) {
+                if (last_s) { uint32_t d=(uint32_t)(absolute_time_diff_us(seg,get_absolute_time())/1000); if(d>s_hi_max)s_hi_max=d; }
+                seg = get_absolute_time(); last_s = s;
+            }
             sleep_ms(1);
         }
+        if (last_s) { uint32_t d=(uint32_t)(absolute_time_diff_us(seg,get_absolute_time())/1000); if(d>s_hi_max)s_hi_max=d; }
         printf("CPU_RESET(26): %s\n",
-               (rh && rl) ? "TOGGLED  (seen high & low - wire good)" :
+               (rh && rl) ? "TOGGLED  (high & low - wire good)" :
                (rh ? "always HIGH" : "always LOW  (not seeing the console)"));
         printf("POST(28):      %s\n",
-               (ph && pl) ? "TOGGLED  (seen high & low - wire good)" :
-               (ph ? "always HIGH (stuck)" : "always LOW  (no POST - check this wire)"));
+               (ph && pl) ? "TOGGLED  (high & low - wire good)" :
+               (ph ? "always HIGH (stuck)" : "always LOW  (no POST - check wire/diode)"));
+        printf("RST_SENSE(29): %s   longest HIGH stretch: %lu ms\n",
+               (sh && sl) ? "TOGGLED  (high & low - wire good)" :
+               (sh ? "always HIGH (never drops - judge can't see resets!)" : "always LOW  (dead - judge can never confirm a boot!)"),
+               (unsigned long)s_hi_max);
+        printf("  (for boot detect GP29 must TOGGLE, and a real boot should show a HIGH stretch of several thousand ms)\n");
     } else if (!strcmp(cmd, "adcmon")) {
         char *a = strtok(NULL, " \t");
         uint32_t secs = a ? (uint32_t)strtoul(a, NULL, 0) : ADC_DEFAULT_SECS;
