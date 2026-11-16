@@ -1,72 +1,66 @@
 ; Matrix Pico EXT_CLK engine (Xenon/Zephyr)
 ;
 ; Logic derived from Octal450's open-source EXT_CLK VHDL (15432, GliGli,
-; Octal450) and the RGH1.3 RP2040 reference. GPLv2 like the rest of the project.
+; Octal450) and confirmed by GHDL simulation of that VHDL. GPLv2.
 ;
-; EXT_CLK differs from RGH 1.2:
-;   - the slowdown point is CPU_EXT_CLK_EN, not CPU_PLL_BYPASS
-;   - the reset pulse is very narrow (~2 cycles / ~10 ns) and the reset line
-;     is PURE OPEN-DRAIN here: only ever pulled low, then released to float.
-;     It is NEVER driven high, so no 3.3V ever reaches the 1.1V reset net.
+; What the sim showed (post_proc.vhd):
+;   - EXT_CLK_EN (to_slow/EXTC) asserts BEFORE the CPU reaches the signature
+;     check, so the check executes on the slowed clock.
+;   - the R_END timer is anchored on a fixed POST edge (post_cnt=24) and fires
+;     the reset ~R_END/2 = 29501 STBY periods (48MHz) later.
+; So the engine has TWO POST phases: count some pulses at full speed, assert
+; EXT_CLK_EN, then count the rest up to the fixed anchor (now slowing), then
+; time r_end off the anchor and pulse. post_count (phase 1) is swept to place
+; the slowdown before the check; the anchor and r_end stay fixed.
 ;
 ; SET pins (base = CPU_RESET, count = 2):
-;   bit 0 = CPU_RESET  (latch held 0; we switch DIRECTION: output=low, input=float)
+;   bit 0 = CPU_RESET  (output=low glitch, input=float release; open-drain)
 ;   bit 1 = EXT_CLK_EN (push-pull output)
-; POST is read on GPIO 28 (needs a fast diode + internal pull-up on this
-; board - 1.1V POST is below the RP2040 threshold). STBY_CLK on GPIO 15.
+; POST on GPIO 28 (via fast diode + internal pull-up). STBY_CLK on GPIO 15.
 ;
-; The C side pushes 5 values: post_count, slow_delay, r_end, pulse_width-1,
-; extc_hold.
+; C pushes 6 values: post_count(phase1), phase2, r_end_coarse, pulse_width-1,
+; fine, extc_hold.
 
 .program extclk
 
-	pull block                  ; x = post_count
+	pull block                  ; x = post_count  (phase 1: full-speed pulses)
 	mov x, osr
-	pull block                  ; y = slow_delay
-	mov y, osr
-
-wait_for_post_loop:
+phase1_loop:
 	wait 1 gpio 28
 	wait 0 gpio 28
-	jmp x-- wait_for_post_loop
+	jmp x-- phase1_loop
 
-slow_delay:
-	jmp y-- slow_delay
+	set pins, 0b10              ; EXT_CLK_EN HIGH - slow the CPU BEFORE the check
 
-	set pins, 0b10              ; EXT_CLK_EN HIGH, reset still floating
+	pull block                  ; x = phase2  (more pulses, now slowing, to the anchor)
+	mov x, osr
+	jmp !x anchor_done          ; phase2 == 0 -> already at the anchor
+phase2_loop:
+	wait 1 gpio 28
+	wait 0 gpio 28
+	jmp x-- phase2_loop
+anchor_done:
 
-	pull block                  ; x = r_end
+	pull block                  ; x = r_end coarse (whole STBY periods)
 	mov x, osr
 	pull block                  ; y = pulse_width - 1
 	mov y, osr
 
-; r_end has two parts (both pushed by the C side):
-;   x = coarse = whole STBY_CLK periods (GP15, 48MHz, 20.8ns), counted drift-free
-;   (later) fine = extra ~5ns sys cycles for sub-period resolution.
-; The Matrix starts its 192MHz R_END timer the instant POST hits 24 edges and
-; counts continuously - it does NOT wait for another POST edge (that edge would
-; arrive at the SLOWED clock and inject a huge variable delay). So we start the
-; STBY count here immediately, no POST wait.
-rend_delay:
+rend_delay:                     ; drift-free: count r_end STBY_CLK periods off the anchor
 	wait 0 gpio 15
 	wait 1 gpio 15
 	jmp x-- rend_delay
 
-; fine sub-period offset: 0-3 extra sys cycles (~5ns each). Lets r_end sweep in
-; the Matrix's own 192MHz units (r_end = whole/4 periods + whole%4 fine), so we
-; stop stepping over a window only a few ns wide.
-	pull block                  ; x = fine
+	pull block                  ; x = fine (0-3 sys cycles, ~5ns each)
 	mov x, osr
-	jmp !x fire                 ; fine == 0 -> fire now (don't underflow the loop)
+	jmp !x fire
 fine_delay:
 	jmp x-- fine_delay
-
 fire:
-	set pindirs, 0b11          ; reset -> output -> LOW (glitch); EXT_CLK_EN stays high
+	set pindirs, 0b11          ; reset -> output LOW (glitch); EXT_CLK_EN stays high
 hold_rst:
 	jmp y-- hold_rst
-
-	set pindirs, 0b10          ; reset -> input -> FLOAT (open-drain release, no 3.3V)
+	set pindirs, 0b10          ; reset -> input FLOAT (open-drain release)
 
 	pull block                  ; x = extc_hold
 	mov x, osr

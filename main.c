@@ -610,10 +610,17 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
         pio_sm_put_blocking(pio, sm, t[3]);                  /* glitch_width */
         pio_sm_put_blocking(pio, sm, t[4]);                  /* pll_hold */
     } else {
+        /* EXT_CLK two-phase (sim-derived): EXT_CLK_EN asserts after post_count
+         * pulses - BEFORE the check - then phase2 more pulses reach the fixed
+         * anchor (post_cnt=24 = EXTCLK_ANCHOR pulses), then r_end off the anchor.
+         * Sweep post_count (t[0]) to place the slowdown; anchor + r_end stay put. */
+        const uint32_t EXTCLK_ANCHOR = 12;
+        uint32_t ph1    = (t[0] < EXTCLK_ANCHOR) ? t[0] : EXTCLK_ANCHOR;
+        uint32_t ph2    = EXTCLK_ANCHOR - ph1;
         uint32_t coarse = t[2] >> 2;                         /* r_end 192MHz-units -> STBY periods */
         uint32_t fine   = t[2] & 3u;                         /* remainder -> ~5ns sys cycles */
-        pio_sm_put_blocking(pio, sm, t[0]);                  /* post_count */
-        pio_sm_put_blocking(pio, sm, t[1]);                  /* slow_delay */
+        pio_sm_put_blocking(pio, sm, ph1);                   /* phase1 pulses (full speed) */
+        pio_sm_put_blocking(pio, sm, ph2);                   /* phase2 pulses (slowing, to anchor) */
         pio_sm_put_blocking(pio, sm, coarse);                /* r_end coarse (STBY periods) */
         pio_sm_put_blocking(pio, sm, t[3] > 0 ? t[3] - 1 : 0); /* pulse_width - 1 */
         pio_sm_put_blocking(pio, sm, fine);                  /* fine sys cycles */
