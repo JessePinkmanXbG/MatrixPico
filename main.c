@@ -890,6 +890,40 @@ static void handle_line(char *line)
     } else if (!strcmp(cmd, "attempts")) {
         g_attempts = 0;
         printf("attempt counter reset.\n");
+    } else if (!strcmp(cmd, "rsttest")) {
+        /* Does our reset output actually reset the console? GP26 is the 1.1V
+         * open-drain reset. Drive it LOW (assert reset) for 20s; a working wire
+         * holds the console in reset (GP29 stays LOW, POST stays dead). If the
+         * console boots normally anyway, the reset point/wire is ineffective and
+         * no glitch timing can ever work. Default level 0 = drive LOW. */
+        char *a = strtok(NULL, " \t");
+        uint32_t lvl = a ? (uint32_t)strtoul(a, NULL, 0) : 0;
+        multicore_lockout_start_blocking();
+        gpio_init(RESET_SENSE); gpio_set_dir(RESET_SENSE, GPIO_IN);
+        if (lvl) { gpio_init(CPU_RESET); gpio_set_dir(CPU_RESET, GPIO_IN); gpio_disable_pulls(CPU_RESET); }  /* release = float */
+        else     { gpio_init(CPU_RESET); gpio_set_dir(CPU_RESET, GPIO_OUT); gpio_put(CPU_RESET, 0); }         /* drive LOW = assert reset */
+        printf("(engine paused) CPU_RESET(26) %s for 20s - power-cycle the console now...\n",
+               lvl ? "RELEASED (float)" : "driven LOW (reset asserted)");
+        bool sh=false, sl=false, ph=false, pl=false;
+        uint32_t s_hi_max=0, pedges=0;
+        bool last_s=gpio_get(RESET_SENSE), last_p=gpio_get(POST_PIN);
+        absolute_time_t t0=get_absolute_time(), seg=t0;
+        while (absolute_time_diff_us(t0, get_absolute_time()) < 20000000) {
+            bool sv=gpio_get(RESET_SENSE); if(sv)sh=true; else sl=true;
+            if (sv!=last_s){ if(last_s){uint32_t d=(uint32_t)(absolute_time_diff_us(seg,get_absolute_time())/1000); if(d>s_hi_max)s_hi_max=d;} seg=get_absolute_time(); last_s=sv; }
+            bool pv=gpio_get(POST_PIN); if(pv)ph=true; else pl=true;
+            if (pv!=last_p){ pedges++; last_p=pv; }
+            sleep_us(200);
+        }
+        if (last_s){uint32_t d=(uint32_t)(absolute_time_diff_us(seg,get_absolute_time())/1000); if(d>s_hi_max)s_hi_max=d;}
+        gpio_init(CPU_RESET); gpio_set_dir(CPU_RESET, GPIO_IN); gpio_disable_pulls(CPU_RESET);
+        multicore_lockout_end_blocking();
+        printf("with CPU_RESET %s:\n", lvl ? "released" : "driven LOW");
+        printf("  RST_SENSE(29): %s   longest HIGH: %lu ms\n",
+               (sh&&sl)?"toggled":(sh?"always HIGH":"always LOW"), (unsigned long)s_hi_max);
+        printf("  POST(28): %s   edges: %lu\n",
+               (ph&&pl)?"toggled":(ph?"always HIGH":"always LOW"), (unsigned long)pedges);
+        printf("  (driving LOW should hold console in reset: GP29 LOW + POST dead. If it boots anyway = reset wire ineffective)\n");
     } else if (!strcmp(cmd, "extctest")) {
         /* Does EXT_CLK_EN actually slow the CPU? Drive GP27 to <level> and watch
          * how the console behaves vs the ~7s baseline from 'mon'. If EXT_CLK_EN
