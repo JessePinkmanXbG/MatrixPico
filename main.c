@@ -162,10 +162,10 @@ static const config_t DEFAULT_CONFIG = {
         /* EXT_CLK seeds from Octal450's Zephyr VHDL @192MHz: r_end 118008,
          * pulse 2, slow_delay ~382ms (73,344,000 cyc), T_BUF 50000, ~12 pulses.
          * These are STRUCTURAL SEEDS - must be dialed in on hardware. */
-        { "zephyr",  METHOD_EXTCLK, { 12, 100, 29502, 2, 50000 } },             /* Matrix R_END 118008@192MHz -> 29502@48MHz; EXTC asserts at anchor */
+        { "zephyr",  METHOD_EXTCLK, { 12, 100, 118008, 2, 50000 } },           /* r_end in Matrix 192MHz units (split to STBY+fine); window 117998-118010 */
         /* Xenon: same EXT_CLK engine; Octal450's VHDL differs from Zephyr only in
          * R_END (118002 vs 118008 @192MHz). Untested - seed, dial in with sweep. */
-        { "xenon",   METHOD_EXTCLK, { 12, 100, 29501, 2, 50000 } },             /* Matrix R_END 118002@192MHz -> 29501@48MHz */
+        { "xenon",   METHOD_EXTCLK, { 12, 100, 118002, 2, 50000 } },           /* r_end in Matrix 192MHz units */
     },
 };
 
@@ -590,13 +590,24 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
     { absolute_time_t dl = delayed_by_ms(get_absolute_time(), 204);
       while (absolute_time_diff_us(get_absolute_time(), dl) > 0) led_tick(); }
 
-    /* Same 5-value feed for both engines (slots mean different things per
-     * method). Reset-low lasts (y + 1) cycles, so pass width-1. */
-    pio_sm_put_blocking(pio, sm, t[0]);                      /* post_count */
-    pio_sm_put_blocking(pio, sm, t[1]);                      /* delay_to_pll / slow_delay */
-    pio_sm_put_blocking(pio, sm, t[2]);                      /* delay_to_rst / r_end */
-    pio_sm_put_blocking(pio, sm, driven ? t[3] : (t[3] > 0 ? t[3] - 1 : 0));   /* glitch_width / pulse_width */
-    pio_sm_put_blocking(pio, sm, t[4]);                      /* pll_hold / extc_hold */
+    /* RGH1.2 feeds 5 values; EXT_CLK feeds 6 (r_end splits into coarse STBY
+     * periods + fine sys cycles). Reset-low lasts (y + 1) cycles -> width-1. */
+    if (driven) {
+        pio_sm_put_blocking(pio, sm, t[0]);                  /* post_count */
+        pio_sm_put_blocking(pio, sm, t[1]);                  /* delay_to_pll */
+        pio_sm_put_blocking(pio, sm, t[2]);                  /* delay_to_rst */
+        pio_sm_put_blocking(pio, sm, t[3]);                  /* glitch_width */
+        pio_sm_put_blocking(pio, sm, t[4]);                  /* pll_hold */
+    } else {
+        uint32_t coarse = t[2] >> 2;                         /* r_end 192MHz-units -> STBY periods */
+        uint32_t fine   = t[2] & 3u;                         /* remainder -> ~5ns sys cycles */
+        pio_sm_put_blocking(pio, sm, t[0]);                  /* post_count */
+        pio_sm_put_blocking(pio, sm, t[1]);                  /* slow_delay */
+        pio_sm_put_blocking(pio, sm, coarse);                /* r_end coarse (STBY periods) */
+        pio_sm_put_blocking(pio, sm, t[3] > 0 ? t[3] - 1 : 0); /* pulse_width - 1 */
+        pio_sm_put_blocking(pio, sm, fine);                  /* fine sys cycles */
+        pio_sm_put_blocking(pio, sm, t[4]);                  /* extc_hold */
+    }
 
     while (pio_sm_is_rx_fifo_empty(pio, sm))
         led_tick();

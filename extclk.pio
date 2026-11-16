@@ -40,19 +40,28 @@ slow_delay:
 	pull block                  ; y = pulse_width - 1
 	mov y, osr
 
-	wait 1 gpio 28              ; anchor r_end on a POST rising edge (CPU-synchronous)
-
-; r_end is now counted in STBY_CLK periods (GP15, ~48MHz, ~20.8ns each) instead
-; of this chip's own cycles. Each loop blocks on one full STBY_CLK period, so the
-; delay is LOCKED to the console's clock - no free-running drift over the ~0.6ms
-; window. This is the whole point of EXT_CLK and what a free-running Pico lacked.
-; At 200MHz sys / 48MHz STBY = ~4.16 instr-slots per period; this 3-instruction
-; loop fits because each wait just blocks until its edge.
+; r_end has two parts (both pushed by the C side):
+;   x = coarse = whole STBY_CLK periods (GP15, 48MHz, 20.8ns), counted drift-free
+;   (later) fine = extra ~5ns sys cycles for sub-period resolution.
+; The Matrix starts its 192MHz R_END timer the instant POST hits 24 edges and
+; counts continuously - it does NOT wait for another POST edge (that edge would
+; arrive at the SLOWED clock and inject a huge variable delay). So we start the
+; STBY count here immediately, no POST wait.
 rend_delay:
 	wait 0 gpio 15
 	wait 1 gpio 15
 	jmp x-- rend_delay
 
+; fine sub-period offset: 0-3 extra sys cycles (~5ns each). Lets r_end sweep in
+; the Matrix's own 192MHz units (r_end = whole/4 periods + whole%4 fine), so we
+; stop stepping over a window only a few ns wide.
+	pull block                  ; x = fine
+	mov x, osr
+	jmp !x fire                 ; fine == 0 -> fire now (don't underflow the loop)
+fine_delay:
+	jmp x-- fine_delay
+
+fire:
 	set pindirs, 0b11          ; reset -> output -> LOW (glitch); EXT_CLK_EN stays high
 hold_rst:
 	jmp y-- hold_rst
