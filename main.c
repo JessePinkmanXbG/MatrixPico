@@ -542,8 +542,18 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
 
     gpio_init(arm_pin);
     gpio_set_dir(arm_pin, GPIO_IN);
-    while (!gpio_get(arm_pin))
-        led_tick();                       /* lets a red phase time out while we wait */
+    if (method == METHOD_EXTCLK) {
+        /* ANCHOR FIX: on this board POST starts ~tens of ms BEFORE GP29
+         * (GPU_RST_DONE) rises. Arming on GP29-HIGH would start the POST count
+         * mid-sequence and mis-place EXT_CLK_EN/glitch. Instead wait for GP29 LOW
+         * (console in reset) so the PIO below catches POST from its very first
+         * edge - matching the Matrix, which counts POST from reset. */
+        while (gpio_get(arm_pin))
+            led_tick();
+    } else {
+        while (!gpio_get(arm_pin))
+            led_tick();                   /* RGH1.2: arm when reset releases (HIGH) */
+    }
 
     pio_sm_config c = (method == METHOD_EXTCLK)
         ? extclk_program_get_default_config(offset)
