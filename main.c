@@ -79,6 +79,20 @@
 #ifndef MP_SYS_CLK_KHZ
 #define MP_SYS_CLK_KHZ 200000   /* ~5 ns per PIO cycle; hardware-validated on Trinity */
 #endif
+/* No-screen auto-run: when powered from the console (no USB to type a command),
+ * start the dense EXT_CLK search automatically on the zephyr profile. */
+#ifndef MP_AUTORUN
+#define MP_AUTORUN 1
+#endif
+#ifndef MP_EXTCLK_PROFILE
+#define MP_EXTCLK_PROFILE 4     /* index of "zephyr" in the profiles[] table below */
+#endif
+/* Marker stored in the (otherwise-unused for EXT_CLK) t[1] slot once a boot has
+ * landed, so the winning r_end (t[2]) and anchor (t[0]) survive a power-cycle
+ * and can be read back from the banner on USB. */
+#ifndef EXTCLK_LOCK_MAGIC
+#define EXTCLK_LOCK_MAGIC 0xA5u
+#endif
 
 /* ---- Profiles ----------------------------------------------------------- */
 #define NUM_TIMINGS     5
@@ -843,6 +857,28 @@ static int find_profile(const char *s)
     return -1;
 }
 
+/* Dense EXT_CLK auto-tune. The signature-check glitch window is only ~3-5 ns
+ * wide (logic-analyzer RE of a real Matrix), so the old 8-unit (~42 ns) r_end
+ * step skated over it almost every time. This sweeps r_end in 1-unit (~5 ns at
+ * 200 MHz) steps across Octal450's known-good Zephyr window (117998-118010 in
+ * 192 MHz units) while hedging the POST anchor +/-1 pulse around post_rgh=24
+ * (= 12 pulses). One attempt runs per console reboot, so leaving it running
+ * revisits every (r_end, anchor) point many times and clock jitter lands it. */
+static void autosweep_setup(void)
+{
+    g_cfg.profiles[g_cfg.active].t[3] = 2;          /* reset pulse = 2 units (~10 ns) = R_LEN=2 */
+    sweep_idx   = 2;                                /* inner: r_end (Matrix 192 MHz units) */
+    sweep_start = 117998; sweep_end = 118010; sweep_step = 1;   /* dense 5 ns steps */
+    sweep_val   = sweep_start;
+    g_as_anchor_lo = 11; g_as_anchor_hi = 13;       /* outer: anchor pulses, hedge +/-1 */
+    g_extclk_anchor = 12;                            /* start on the exact Matrix anchor (post_rgh=24) */
+    g_as_anchor_changed = true;
+    sweep_landed = false;
+    g_autosweep = true;
+    sweep_active = true;
+    g_halt = false;
+}
+
 static void handle_line(char *line)
 {
     char *cmd = strtok(line, " \t");
@@ -1135,23 +1171,12 @@ static void handle_line(char *line)
                (unsigned long)s, (unsigned long)e, (long)st);
         printf("power-cycle the console; it steps each miss until it boots.\n");
     } else if (!strcmp(cmd, "autosweep")) {
-        /* 2-D unattended search: anchor (outer) x r_end (inner), fixed ~20ns
-         * pulse. Covers both coupled unknowns; stops on a real boot. ~600
-         * combos ~ 1 hour. */
-        g_cfg.profiles[g_cfg.active].t[3] = 3;            /* pulse ~15ns */
-        sweep_idx   = 2;                                  /* inner: r_end (Matrix /4 units) */
-        sweep_start = 40; sweep_end = 8000; sweep_step = 8;   /* r_end ~10-2000 STBY periods, 2-period steps - the SMALL zone (clock-stop) */
-        sweep_val   = sweep_start;
-        g_as_anchor_lo = 9; g_as_anchor_hi = 11;          /* outer: anchor pulses around the confirmed ~10 */
-        g_extclk_anchor = g_as_anchor_lo;
-        g_as_anchor_changed = true;
-        sweep_landed = false;
-        g_autosweep = true;
-        sweep_active = true;
-        g_halt = false;
-        printf("AUTOSWEEP: anchor %lu-%lu x r_end %lu-%lu step %ld, pulse=4 (~600 combos)\n",
+        /* Dense fine-phase search over Octal450's known-good Zephyr window. */
+        autosweep_setup();
+        printf("AUTOSWEEP (dense): anchor %lu-%lu x r_end %lu-%lu step %ld (~5ns), pulse=%lu\n",
                (unsigned long)g_as_anchor_lo, (unsigned long)g_as_anchor_hi,
-               (unsigned long)sweep_start, (unsigned long)sweep_end, (long)sweep_step);
+               (unsigned long)sweep_start, (unsigned long)sweep_end, (long)sweep_step,
+               (unsigned long)g_cfg.profiles[g_cfg.active].t[3]);
         printf("power-cycle the console and leave it running; one real boot stops it.\n");
     } else if (!strcmp(cmd, "resume")) {
         if (g_halt) {
@@ -1217,11 +1242,45 @@ int main(void)
     /* DIAG: option bit2 = POST pull-down (reset default of the RP2040 pad). */
     gpio_set_pulls(POST_PIN, false, true);   /* chip default (pull-down), as in the proven build */
 
+#if MP_AUTORUN
+    /* No-screen bring-up: powered from the console there is no serial to type
+     * 'autosweep', so start the dense EXT_CLK search automatically. Force the
+     * zephyr (EXT_CLK) profile and reseed its fixed timings BEFORE launching
+     * core1, so core1 never spends its first cycles running the saved profile
+     * (which could be an RGH1.2 one that drives the reset line) on a Zephyr. */
+    bool autorun = (MP_EXTCLK_PROFILE < NUM_PROFILES &&
+                    g_cfg.profiles[MP_EXTCLK_PROFILE].method == METHOD_EXTCLK);
+    uint32_t saved_rend = 0, saved_anchor = 0; bool have_saved = false;
+    if (autorun) {
+        g_cfg.active = MP_EXTCLK_PROFILE;
+        uint32_t *zt = g_cfg.profiles[g_cfg.active].t;
+        /* Surface any previously-saved landing (from an earlier successful boot)
+         * before we reseed and sweep again. */
+        if (zt[1] == EXTCLK_LOCK_MAGIC) {
+            have_saved = true; saved_rend = zt[2]; saved_anchor = zt[0];
+        }
+        zt[0] = 12; zt[1] = 100; zt[2] = 118008; zt[3] = 2; zt[4] = 50000;
+        autosweep_setup();
+    }
+#endif
+
     multicore_launch_core1(core1_main);
 
     sleep_ms(500);
     print_banner();
     print_status();
+
+#if MP_AUTORUN
+    if (autorun) {
+        printf("\n[AUTORUN] dense EXT_CLK autosweep running: r_end %lu-%lu step 1 (~5ns),\n"
+               "          anchor %lu-%lu pulses, pulse=2. LED: blue=trying, green=BOOT, red=miss.\n",
+               (unsigned long)sweep_start, (unsigned long)sweep_end,
+               (unsigned long)g_as_anchor_lo, (unsigned long)g_as_anchor_hi);
+        if (have_saved)
+            printf("[AUTORUN] *** previous successful boot saved: r_end=%lu anchor=%lu pulses ***\n",
+                   (unsigned long)saved_rend, (unsigned long)saved_anchor);
+    }
+#endif
     printf("> ");
 
     uint32_t last_tick = 0;
@@ -1238,7 +1297,16 @@ int main(void)
         }
         if (sweep_landed) {
             sweep_landed = false;
-            printf("\n*** GLITCH LANDED: r_end = %lu  anchor = %lu pulses ***  ('save' to keep)\n> ",
+            /* Persist the winning timing to flash so a no-screen (console-powered)
+             * boot isn't lost on power-cycle. t[2] already holds the landed r_end
+             * (run_glitch_once wrote sweep_val before the attempt); stamp the anchor
+             * into t[0] and the lock marker into t[1], then save. */
+            g_cfg.profiles[g_cfg.active].t[0] = g_as_anchor_landed;
+            g_cfg.profiles[g_cfg.active].t[1] = EXTCLK_LOCK_MAGIC;
+            g_cfg.profiles[g_cfg.active].t[2] = sweep_landed_val;
+            config_save();
+            printf("\n*** GLITCH LANDED + SAVED: r_end = %lu  anchor = %lu pulses ***\n"
+                   "    (persisted to flash; read it back from the banner next USB boot)\n> ",
                    (unsigned long)sweep_landed_val, (unsigned long)g_as_anchor_landed);
         }
         sleep_ms(2);
