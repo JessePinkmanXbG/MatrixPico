@@ -183,7 +183,8 @@ typedef struct { uint32_t e15, etot, ms; uint8_t done; absolute_time_t t0; } his
 static hist_t g_hist[16];
 static volatile uint32_t g_hist_n = 0;       /* attempts started since boot */
 static volatile uint32_t g_last_edges = 0;   /* POST edges seen 4s after the last glitch */
-static volatile uint32_t g_boot_edges = 3;   /* edges needed to call it a real boot */
+static volatile uint32_t g_boot_edges = 3;   /* (legacy, unused by the boot judge now) */
+#define BOOT_HOLD_MS 8000   /* arm_pin must stay HIGH this long to count as a real boot */
 
 /* Sweep (auto-tune) state, shared core0 <-> core1. When active, core1 applies
  * sweep_val to the active profile's timing[sweep_idx] on each attempt and steps
@@ -627,43 +628,31 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
     hist_t *hh = &g_hist[g_hist_n % 16];
     hh->e15 = 0; hh->etot = 0; hh->ms = 0; hh->done = 0; hh->t0 = t0;
     g_hist_n++;
-    bool judged = false;
     bool booted = false;
-    bool red_done = false;
     uint32_t edges = 0;
     bool lastp = gpio_get(POST_PIN);
+    /* Real boot vs failed glitch, with only one POST bit:
+     * a real boot holds the console OUT of reset (arm_pin stays HIGH) forever;
+     * a failed glitch hangs at most a few seconds before the SMC watchdog resets
+     * it, dropping arm_pin. So "booted" = arm_pin stays HIGH for BOOT_HOLD_MS
+     * (longer than any hang). Edge counting (3 edges) false-landed on the normal
+     * CB POST burst that happens on EVERY attempt - this does not. POST edges are
+     * still tallied for the 'last' command. */
     while (gpio_get(arm_pin)) {
         bool p = gpio_get(POST_PIN);
         if (p != lastp) { edges++; lastp = p; hh->etot = edges; }
         led_tick();
-        /* Green as soon as the POST edges prove a boot - but never before the 2.5s
-         * blue flicker has finished plus a short dark gap (GREEN_GAP_MS), so the
-         * sequence always reads blue -> pause -> green. */
-        if (!judged && edges >= g_boot_edges &&
-            absolute_time_diff_us(get_absolute_time(), delayed_by_ms(g_flick_end, GREEN_GAP_MS)) <= 0) {
-            judged = true;
-            g_last_edges = edges;
-            hh->e15 = edges;
+        if (absolute_time_diff_us(t0, get_absolute_time()) >= (int64_t)BOOT_HOLD_MS * 1000) {
             booted = true;
-            led_green_hold();
-        }
-        if (!judged && absolute_time_diff_us(t0, get_absolute_time()) > 4000000) {
-            judged = true;
             g_last_edges = edges;
             hh->e15 = edges;
-            if (edges >= g_boot_edges) {
-                booted = true;
-                led_green_hold();          /* boot confirmed: solid green 5s */
-            } else {
-                led_red_for(1000);         /* hung: red 1s, keep waiting for the reset */
-                red_done = true;
-            }
+            led_green_hold();              /* held out of reset = real boot: solid green */
+            break;
         }
     }
     hh->ms = (uint32_t)(absolute_time_diff_us(t0, get_absolute_time()) / 1000);
     hh->done = 1;
-    if (!judged) { g_last_edges = edges; hh->e15 = edges; }   /* reset dropped before 4s: a miss */
-    if (!booted && !red_done) led_red_for(1000);
+    if (!booted) { g_last_edges = edges; hh->e15 = edges; led_red_for(1000); }
 
     if (sweep_active) {
         if (booted) {
