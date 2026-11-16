@@ -199,6 +199,15 @@ static volatile uint32_t sweep_tick = 0;         /* bumped each step, for core0 
 static volatile bool     sweep_landed = false;
 static volatile uint32_t sweep_landed_val = 0;
 
+/* 2-D auto-sweep: sweeps r_end (index 2) as the inner loop and the EXT_CLK
+ * anchor (POST pulses to the r_end reference) as the outer loop, so a single
+ * run covers both coupled unknowns. Stops on a real boot. */
+static volatile bool     g_autosweep = false;
+static volatile uint32_t g_as_anchor_lo = 10, g_as_anchor_hi = 13;
+static volatile uint32_t g_extclk_anchor = 12;     /* current anchor, in POST pulses */
+static volatile uint32_t g_as_anchor_landed = 0;
+static volatile bool     g_as_anchor_changed = false;
+
 /* Set when a sweep lands a boot: core1 stops attempting further glitches so a
  * console that just came up stays up, instead of being re-glitched forever.
  * Cleared by starting a new sweep, switching profiles, or 'resume'. */
@@ -614,9 +623,15 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
          * pulses - BEFORE the check - then phase2 more pulses reach the fixed
          * anchor (post_cnt=24 = EXTCLK_ANCHOR pulses), then r_end off the anchor.
          * Sweep post_count (t[0]) to place the slowdown; anchor + r_end stay put. */
-        const uint32_t EXTCLK_ANCHOR = 12;
-        uint32_t ph1    = (t[0] < EXTCLK_ANCHOR) ? t[0] : EXTCLK_ANCHOR;
-        uint32_t ph2    = EXTCLK_ANCHOR - ph1;
+        uint32_t anchor = g_autosweep ? g_extclk_anchor : 12;
+        uint32_t ph1, ph2;
+        if (g_autosweep) {
+            ph1 = (anchor > 0) ? anchor - 1 : 0;   /* EXT_CLK_EN ~1 pulse before the anchor */
+            ph2 = anchor - ph1;
+        } else {
+            ph1 = (t[0] < anchor) ? t[0] : anchor; /* manual: post_count = assert point */
+            ph2 = anchor - ph1;
+        }
         uint32_t coarse = t[2] >> 2;                         /* r_end 192MHz-units -> STBY periods */
         uint32_t fine   = t[2] & 3u;                         /* remainder -> ~5ns sys cycles */
         pio_sm_put_blocking(pio, sm, ph1);                   /* phase1 pulses (full speed) */
@@ -674,14 +689,23 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
     if (sweep_active) {
         if (booted) {
             sweep_landed_val = sweep_val;
+            g_as_anchor_landed = g_extclk_anchor;
             sweep_landed = true;
             sweep_active = false;
+            g_autosweep = false;
             g_halt = true;      /* stay off the console now that it has booted */
         } else {
             int64_t nv = (int64_t)sweep_val + (int64_t)sweep_step;
             if ((sweep_step > 0 && nv > (int64_t)sweep_end) ||
-                (sweep_step < 0 && nv < (int64_t)sweep_end))
+                (sweep_step < 0 && nv < (int64_t)sweep_end)) {
                 nv = (int64_t)sweep_start;        /* wrap around */
+                if (g_autosweep) {                /* finished an r_end pass: step the anchor */
+                    uint32_t a = g_extclk_anchor + 1;
+                    if (a > g_as_anchor_hi) a = g_as_anchor_lo;
+                    g_extclk_anchor = a;
+                    g_as_anchor_changed = true;
+                }
+            }
             sweep_val = (uint32_t)nv;
             sweep_tick++;
         }
@@ -1021,6 +1045,25 @@ static void handle_line(char *line)
         printf("sweeping %s from %lu to %lu step %ld\n", tname(g_cfg.profiles[g_cfg.active].method, idx),
                (unsigned long)s, (unsigned long)e, (long)st);
         printf("power-cycle the console; it steps each miss until it boots.\n");
+    } else if (!strcmp(cmd, "autosweep")) {
+        /* 2-D unattended search: anchor (outer) x r_end (inner), fixed ~20ns
+         * pulse. Covers both coupled unknowns; stops on a real boot. ~600
+         * combos ~ 1 hour. */
+        g_cfg.profiles[g_cfg.active].t[3] = 4;            /* pulse ~20ns */
+        sweep_idx   = 2;                                  /* inner: r_end */
+        sweep_start = 117408; sweep_end = 118608; sweep_step = 8;  /* 29352-29652 STBY periods, 2-period steps */
+        sweep_val   = sweep_start;
+        g_as_anchor_lo = 10; g_as_anchor_hi = 13;         /* outer: anchor pulses */
+        g_extclk_anchor = g_as_anchor_lo;
+        g_as_anchor_changed = true;
+        sweep_landed = false;
+        g_autosweep = true;
+        sweep_active = true;
+        g_halt = false;
+        printf("AUTOSWEEP: anchor %lu-%lu x r_end %lu-%lu step %ld, pulse=4 (~600 combos)\n",
+               (unsigned long)g_as_anchor_lo, (unsigned long)g_as_anchor_hi,
+               (unsigned long)sweep_start, (unsigned long)sweep_end, (long)sweep_step);
+        printf("power-cycle the console and leave it running; one real boot stops it.\n");
     } else if (!strcmp(cmd, "resume")) {
         if (g_halt) {
             g_halt = false;
@@ -1097,13 +1140,17 @@ int main(void)
         console_task();
         if (sweep_active && sweep_tick != last_tick) {
             last_tick = sweep_tick;
+            if (g_autosweep && g_as_anchor_changed) {
+                g_as_anchor_changed = false;
+                printf("  == anchor -> %lu pulses ==\n", (unsigned long)g_extclk_anchor);
+            }
             printf("  sweep: %s = %lu\n", tname(g_cfg.profiles[g_cfg.active].method, sweep_idx),
                    (unsigned long)sweep_val);
         }
         if (sweep_landed) {
             sweep_landed = false;
-            printf("\n*** GLITCH LANDED: %s = %lu ***  ('save' to keep)\n> ",
-                   tname(g_cfg.profiles[g_cfg.active].method, sweep_idx), (unsigned long)sweep_landed_val);
+            printf("\n*** GLITCH LANDED: r_end = %lu  anchor = %lu pulses ***  ('save' to keep)\n> ",
+                   (unsigned long)sweep_landed_val, (unsigned long)g_as_anchor_landed);
         }
         sleep_ms(2);
     }
