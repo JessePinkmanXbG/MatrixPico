@@ -981,6 +981,52 @@ static void handle_line(char *line)
         printf("  POST(28): %s   edges: %lu\n",
                (ph&&pl)?"toggled":(ph?"always HIGH":"always LOW"), (unsigned long)pedges);
         printf("  (compare to 'mon' baseline ~7000ms. BIG change = EXT_CLK_EN works; same = wrong point/polarity)\n");
+    } else if (!strcmp(cmd, "captureslow")) {
+        /* Measure r_end directly: arm, count N POST pulses (full speed) to the
+         * check anchor, assert EXT_CLK_EN to slow the CPU, then timestamp POST
+         * edges. The CPU creeps to the (now slowed) signature check and hangs; the
+         * delay from EXT_CLK_EN assert to the last POST edge before that hang IS
+         * r_end in real time -> STBY periods = that delay x 48. Engine stays off;
+         * this just slows + watches, no glitch pulse. */
+        #define CAPS_MAX 2500u
+        static uint32_t caps_t[CAPS_MAX]; static uint8_t caps_c[CAPS_MAX];
+        char *a = strtok(NULL, " \t");
+        uint32_t npulse = a ? (uint32_t)strtoul(a,NULL,0) : 10;
+        multicore_lockout_start_blocking();
+        gpio_init(POST_PIN);    gpio_set_dir(POST_PIN, GPIO_IN);    gpio_pull_up(POST_PIN);
+        gpio_init(RESET_SENSE); gpio_set_dir(RESET_SENSE, GPIO_IN);
+        gpio_init(PLL_BYPASS);  gpio_set_dir(PLL_BYPASS, GPIO_OUT); gpio_put(PLL_BYPASS, 0);  /* EXT_CLK_EN low */
+        printf("CAPTURESLOW: arm on reset, count %lu POST pulses, assert EXT_CLK_EN, watch 400ms.\n", (unsigned long)npulse);
+        printf("Power-cycle the console now...\n");
+        /* arm: wait for GP29 LOW (reset), then catch POST from the first edge */
+        while (gpio_get(RESET_SENSE)) { if (getchar_timeout_us(0) != PICO_ERROR_TIMEOUT) { } tight_loop_contents(); }
+        /* count npulse POST pulses (rising+falling) at full speed */
+        for (uint32_t k=0;k<npulse;k++){
+            while(!gpio_get(POST_PIN)) tight_loop_contents();
+            while(gpio_get(POST_PIN)) tight_loop_contents();
+        }
+        gpio_put(PLL_BYPASS, 1);                      /* EXT_CLK_EN HIGH: slow the CPU NOW */
+        uint64_t t0=time_us_64(), tend=t0+400000ull;  /* watch 400ms */
+        uint32_t n=0; bool lp=gpio_get(POST_PIN), ls=gpio_get(RESET_SENSE);
+        while (time_us_64() < tend && n < CAPS_MAX) {
+            uint32_t now=(uint32_t)(time_us_64()-t0);
+            bool p=gpio_get(POST_PIN);
+            if (p!=lp){ caps_t[n]=now; caps_c[n]=(p?1u:0u); n++; lp=p; if(n>=CAPS_MAX)break; }
+            bool sg=gpio_get(RESET_SENSE);
+            if (sg!=ls){ caps_t[n]=now; caps_c[n]=2u|(sg?1u:0u); ls=sg; n++; }
+        }
+        gpio_put(PLL_BYPASS, 0);                      /* release EXT_CLK_EN */
+        multicore_lockout_end_blocking();
+        /* last POST edge before the longest gap = the slowed check */
+        uint32_t pedges=0, prev=0, gap=0, gap_end_t=0, last_post_before_gap=0; bool hp=false;
+        for (uint32_t i=0;i<n;i++) if((caps_c[i]&2u)==0){ pedges++;
+            if(hp){ uint32_t g=caps_t[i]-prev; if(g>gap){gap=g; last_post_before_gap=prev;} }
+            prev=caps_t[i]; hp=true; }
+        printf("edges after slowdown: %lu (%lu POST)\n",(unsigned long)n,(unsigned long)pedges);
+        printf("last POST edge before the slowed check: t=%lu us after EXT_CLK_EN\n",(unsigned long)last_post_before_gap);
+        printf("  -> r_end estimate ~ %lu STBY periods (t_us x 48)\n",(unsigned long)((uint64_t)last_post_before_gap*48ull));
+        printf("raw (t_us : sig):\n");
+        for (uint32_t i=0;i<n;i++){ const char *nm=(caps_c[i]&2u)?"RST29":"POST "; printf("  %lu %s %s\n",(unsigned long)caps_t[i],nm,(caps_c[i]&1u)?"H":"L"); }
     } else if (!strcmp(cmd, "capture")) {
         /* Pico-as-logic-analyzer: timestamp every POST(28) and RST_SENSE(29) edge
          * during a boot, engine paused. On a FAILED boot POST advances to the
