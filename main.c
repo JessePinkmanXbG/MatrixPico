@@ -87,6 +87,15 @@
 #ifndef MP_EXTCLK_PROFILE
 #define MP_EXTCLK_PROFILE 4     /* index of "zephyr" in the profiles[] table below */
 #endif
+/* Speed: force a console reboot on a hung (failed) attempt instead of waiting
+ * ~7s for the SMC watchdog. Safe because it only fires on frozen POST in a
+ * 3-7s window; a real boot keeps POST moving. Set MP_FORCE_REBOOT=0 to disable. */
+#ifndef MP_FORCE_REBOOT
+#define MP_FORCE_REBOOT 1
+#endif
+#ifndef MP_FREEZE_MS
+#define MP_FREEZE_MS 2200       /* POST still this long while held high = hang */
+#endif
 /* Marker stored in the (otherwise-unused for EXT_CLK) t[1] slot once a boot has
  * landed, so the winning r_end (t[2]) and anchor (t[0]) survive a power-cycle
  * and can be read back from the banner on USB. */
@@ -677,6 +686,7 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
     bool booted = false;
     uint32_t edges = 0;
     bool lastp = gpio_get(POST_PIN);
+    absolute_time_t last_edge_t = t0;     /* for force-reboot: when POST last moved */
     /* Real boot vs failed glitch, with only one POST bit:
      * a real boot holds the console OUT of reset (arm_pin stays HIGH) forever;
      * a failed glitch hangs at most a few seconds before the SMC watchdog resets
@@ -686,15 +696,35 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
      * still tallied for the 'last' command. */
     while (gpio_get(arm_pin)) {
         bool p = gpio_get(POST_PIN);
-        if (p != lastp) { edges++; lastp = p; hh->etot = edges; }
+        if (p != lastp) { edges++; lastp = p; hh->etot = edges; last_edge_t = get_absolute_time(); }
         led_tick();
-        if (absolute_time_diff_us(t0, get_absolute_time()) >= (int64_t)BOOT_HOLD_MS * 1000) {
+        int64_t el = absolute_time_diff_us(t0, get_absolute_time());
+        if (el >= (int64_t)BOOT_HOLD_MS * 1000) {
             booted = true;
             g_last_edges = edges;
             hh->e15 = edges;
             led_green_hold();              /* held out of reset = real boot: solid green */
             break;
         }
+#if MP_FORCE_REBOOT
+        /* SPEED (EXT_CLK only): a failed glitch hangs with POST frozen while the
+         * console sits out of reset, then the SMC watchdog reboots it ~7s later.
+         * Don't wait for the watchdog - once POST has been completely still for
+         * FREEZE_MS while held high, it's a hang (a real boot keeps toggling POST
+         * as XeLL loads), so pulse CPU_RESET ourselves to restart now. Gated to a
+         * 3-7s window: before 3s avoids the normal CB POST burst, and past ~7s we
+         * let it ride to the BOOT_HOLD confirm (a hang would already be gone), so
+         * this can never cut off a genuinely-booting console. */
+        if (method == METHOD_EXTCLK && el >= 3000 * 1000 && el < 7000 * 1000 &&
+            absolute_time_diff_us(last_edge_t, get_absolute_time()) >= (int64_t)MP_FREEZE_MS * 1000) {
+            gpio_init(CPU_RESET);
+            gpio_set_dir(CPU_RESET, GPIO_OUT);
+            gpio_put(CPU_RESET, 0);        /* assert console reset (open-drain low) */
+            sleep_ms(40);
+            gpio_set_dir(CPU_RESET, GPIO_IN);  /* release: float, console reboots */
+            break;                          /* scored as a miss; sweep steps, next attempt */
+        }
+#endif
     }
     hh->ms = (uint32_t)(absolute_time_diff_us(t0, get_absolute_time()) / 1000);
     hh->done = 1;
