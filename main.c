@@ -655,8 +655,13 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
         uint32_t anchor = g_autosweep ? g_extclk_anchor : 12;
         uint32_t ph1, ph2;
         if (g_autosweep) {
-            ph1 = (anchor > 0) ? anchor - 1 : 0;   /* EXT_CLK_EN ~1 pulse before the anchor */
-            ph2 = anchor - ph1;
+            /* Assert EXT_CLK_EN AT the anchor (the last full-speed POST pulse
+             * before the check), NOT a pulse earlier. The capture showed big
+             * (262/415 ms) POST gaps right before the check; asserting before
+             * them made the slowed CPU crawl through them and mis-time the glitch.
+             * Slow only at the check, where the memcmp actually runs. */
+            ph1 = anchor;
+            ph2 = 0;
         } else {
             ph1 = (t[0] < anchor) ? t[0] : anchor; /* manual: post_count = assert point */
             ph2 = anchor - ph1;
@@ -904,13 +909,12 @@ static void autosweep_setup(void)
 {
     g_cfg.profiles[g_cfg.active].t[3] = 2;          /* reset pulse = 2 units (~10 ns) = R_LEN=2 */
     sweep_idx   = 2;                                /* inner: r_end (Matrix 192 MHz units) */
-    sweep_start = 117994; sweep_end = 118014; sweep_step = 1;   /* dense 5 ns steps, slight margin */
+    sweep_start = 117988; sweep_end = 118028; sweep_step = 1;   /* dense 5 ns steps, +/-100ns */
     sweep_val   = sweep_start;
-    /* With the 204ms blind delay removed we now catch POST from the first edge,
-     * so the undercount is gone and the real Matrix anchor applies: post_rgh=24
-     * edges = 12 pulses. Hedge 11-13. */
-    g_as_anchor_lo = 11; g_as_anchor_hi = 13;
-    g_extclk_anchor = 12;
+    /* MEASURED: the capture put the signature check right after POST edge #26 =
+     * 13 pulses, identically on two consecutive boots. Pin the anchor there. */
+    g_as_anchor_lo = 13; g_as_anchor_hi = 13;
+    g_extclk_anchor = 13;
     g_as_anchor_changed = true;
     sweep_landed = false;
     g_autosweep = true;
