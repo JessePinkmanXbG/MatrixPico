@@ -502,12 +502,14 @@ static inline void led_red(void)   { gpio_put(LED_PIN, 1); }
 /* ---- Glitch core (core1) ------------------------------------------------ */
 
 /* ---- LED state machine (core1) ------------------------------------------
- * Fast blue flicker for 2.5s from the moment we arm; solid green for 5s on a
- * confirmed boot; red for 1s on a failed attempt. Everything is non-blocking
- * (except the green hold) so a red/blue phase never delays arming the next try. */
-#define GREEN_GAP_MS 500   /* dark gap between the blue flicker and the green */
+ * Readable states: SOLID BLUE the whole time it's arming/attempting a glitch,
+ * a clear SOLID RED flash on each failed attempt, and SOLID GREEN that LATCHES
+ * and stays on (until the Pico is re-powered) on a confirmed boot - so a boot
+ * that lands overnight is still obvious in the morning. Non-blocking. */
+#define GREEN_GAP_MS 500   /* (retained for compatibility) */
 static int g_led_cur = -1;                       /* 0 off, 1 blue, 2 red, 3 green */
-static absolute_time_t g_flick_t0, g_flick_end, g_red_end;   /* zero-init = nil_time */
+static absolute_time_t g_red_end;                /* red-flash deadline; zero = nil_time */
+static bool g_green_latched = false;             /* confirmed boot -> green stays on */
 
 static void led_set(int c)
 {
@@ -523,35 +525,29 @@ static void led_set(int c)
 
 static void led_tick(void)
 {
-    absolute_time_t n = get_absolute_time();
-    if (absolute_time_diff_us(n, g_red_end) > 0) { led_set(2); return; }
-    if (absolute_time_diff_us(n, g_flick_end) > 0) {
-        int64_t el = absolute_time_diff_us(g_flick_t0, n);
-        led_set(((el / 17000) & 1) == 0 ? 1 : 0);
-        return;
-    }
-    led_set(0);
+    if (g_green_latched) { led_set(3); return; }                 /* booted: stay green */
+    if (absolute_time_diff_us(get_absolute_time(), g_red_end) > 0) { led_set(2); return; } /* red flash */
+    led_set(1);                                                  /* default: solid blue = attempting */
 }
 
-static void led_flicker_start(void)
-{
-    g_flick_t0 = get_absolute_time();
-    g_flick_end = delayed_by_ms(g_flick_t0, 2500);
-}
-
-static void led_red_for(uint ms)
-{
-    g_red_end = make_timeout_time_ms(ms);
-    led_tick();
-}
-
-static void led_green_hold(void)               /* confirmed boot: solid green 5s */
+static void led_flicker_start(void)            /* start of an attempt: clear red, go solid blue */
 {
     g_red_end = nil_time;
-    g_flick_end = nil_time;
+    if (!g_green_latched) led_set(1);
+}
+
+static void led_red_for(uint ms)               /* failed attempt: clear solid red for ms */
+{
+    if (g_green_latched) return;
+    g_red_end = make_timeout_time_ms(ms);
+    led_set(2);
+}
+
+static void led_green_hold(void)               /* confirmed boot: latch solid green, stays on */
+{
+    g_green_latched = true;
+    g_red_end = nil_time;
     led_set(3);
-    sleep_ms(5000);
-    led_set(0);
 }
 
 
