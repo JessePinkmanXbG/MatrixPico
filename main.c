@@ -628,10 +628,16 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
     pio_sm_set_enabled(pio, sm, true);
 
     led_flicker_start();      /* 2.5s fast blue flicker, non-blocking */
-    /* The proven build waited ~200ms here before sending the timing values; keep
-     * that so POST counting starts at exactly the same moment. */
-    { absolute_time_t dl = delayed_by_ms(get_absolute_time(), 204);
-      while (absolute_time_diff_us(get_absolute_time(), dl) > 0) led_tick(); }
+    /* RGH1.2 (driven) waited ~204ms here so POST counting starts at the proven
+     * moment. EXT_CLK must NOT: on this board POST begins during that window, so
+     * the delay made us miss the first POST edges and undercount the anchor. Arm
+     * (GP29 just went low = reset) then start counting immediately, so the PIO's
+     * first 'wait 1 gpio POST' catches the boot's very first POST edge - matching
+     * a Matrix, which counts POST from reset. */
+    if (driven) {
+        absolute_time_t dl = delayed_by_ms(get_absolute_time(), 204);
+        while (absolute_time_diff_us(get_absolute_time(), dl) > 0) led_tick();
+    }
 
     /* RGH1.2 feeds 5 values; EXT_CLK feeds 6 (r_end splits into coarse STBY
      * periods + fine sys cycles). Reset-low lasts (y + 1) cycles -> width-1. */
@@ -900,11 +906,11 @@ static void autosweep_setup(void)
     sweep_idx   = 2;                                /* inner: r_end (Matrix 192 MHz units) */
     sweep_start = 117994; sweep_end = 118014; sweep_step = 1;   /* dense 5 ns steps, slight margin */
     sweep_val   = sweep_start;
-    /* Our diode POST read undercounts edges vs a real Matrix: our own capture put
-     * the signature check at our edge ~20 (= 10 pulses), so anchor around 10, not
-     * the Matrix's literal post_rgh=24 (=12). Hedge 9-11. */
-    g_as_anchor_lo = 9; g_as_anchor_hi = 11;
-    g_extclk_anchor = 10;
+    /* With the 204ms blind delay removed we now catch POST from the first edge,
+     * so the undercount is gone and the real Matrix anchor applies: post_rgh=24
+     * edges = 12 pulses. Hedge 11-13. */
+    g_as_anchor_lo = 11; g_as_anchor_hi = 13;
+    g_extclk_anchor = 12;
     g_as_anchor_changed = true;
     sweep_landed = false;
     g_autosweep = true;
