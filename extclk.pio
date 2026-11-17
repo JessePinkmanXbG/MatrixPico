@@ -1,71 +1,70 @@
-; Matrix Pico EXT_CLK engine (Xenon/Zephyr)
+; Matrix Pico EXT_CLK engine (Xenon/Zephyr) - FAITHFUL FSM PORT
 ;
-; Logic derived from Octal450's open-source EXT_CLK VHDL (15432, GliGli,
-; Octal450) and confirmed by GHDL simulation of that VHDL. GPLv2.
+; Logic derived from Octal450's EXT_CLK VHDL (15432, GliGli, Octal450) and
+; CONFIRMED by GHDL simulation of post_proc.vhd + slower.vhd. GPLv2.
 ;
-; What the sim showed (post_proc.vhd):
-;   - EXT_CLK_EN (to_slow/EXTC) asserts BEFORE the CPU reaches the signature
-;     check, so the check executes on the slowed clock.
-;   - the R_END timer is anchored on a fixed POST edge (post_cnt=24) and fires
-;     the reset ~R_END/2 = 29501 STBY periods (48MHz) later.
-; So the engine has TWO POST phases: count some pulses at full speed, assert
-; EXT_CLK_EN, then count the rest up to the fixed anchor (now slowing), then
-; time r_end off the anchor and pulse. post_count (phase 1) is swept to place
-; the slowdown before the check; the anchor and r_end stay fixed.
+; The mechanism the sim proved (and that our earlier open-loop builds missed):
+;   1. count POST pulses to the code just before the long pre-check POST gap
+;      (post_cnt = post_rgh-1 = 23).
+;   2. DWELL for delay_val time (slower.vhd) - this is spent inside that gap,
+;      at full CPU speed - THEN assert EXT_CLK_EN. So the slowdown lands inside
+;      the gap, with the CPU still running, right before the signature check.
+;   3. wait for the next POST edge (post_cnt = 24 = the check), now slowed.
+;   4. time R_END STBY periods off that edge and pulse CPU_RESET.
 ;
-; SET pins (base = CPU_RESET, count = 2):
-;   bit 0 = CPU_RESET  (output=low glitch, input=float release; open-drain)
-;   bit 1 = EXT_CLK_EN (push-pull output)
-; POST on GPIO 28 (via fast diode + internal pull-up). STBY_CLK on GPIO 15.
+; SET pins (base = CPU_RESET, count = 2): bit0 = CPU_RESET (open-drain glitch),
+; bit1 = EXT_CLK_EN (push-pull). POST on GPIO 28 (diode + pull-up). STBY on GP15.
+; Uses autopull (threshold 32): each `out x,32` consumes one pushed value.
 ;
-; C pushes 6 values: post_count(phase1), phase2, r_end_coarse, pulse_width-1,
-; fine, extc_hold.
+; C pushes 7 values in order: post_count, dwell_periods, phase2,
+; r_end_coarse, pulse_width-1, fine, extc_hold.
 
 .program extclk
 
-	pull block                  ; x = post_count  (phase 1: full-speed pulses)
-	mov x, osr
+    out x, 32                   ; post_count  (phase 1: full-speed pulses to post_cnt=23)
 phase1_loop:
-	wait 1 gpio 28
-	wait 0 gpio 28
-	jmp x-- phase1_loop
+    wait 1 gpio 28
+    wait 0 gpio 28
+    jmp x-- phase1_loop
 
-	set pins, 0b10              ; EXT_CLK_EN HIGH - slow the CPU BEFORE the check
+    out x, 32                   ; dwell_periods (slower.vhd delay_val, in STBY periods)
+    jmp !x no_dwell             ; 0 -> assert immediately (legacy behavior)
+dwell_loop:                     ; wait inside the pre-check gap, CPU still full speed
+    wait 0 gpio 15
+    wait 1 gpio 15
+    jmp x-- dwell_loop
+no_dwell:
 
-	pull block                  ; x = phase2  (more pulses, now slowing, to the anchor)
-	mov x, osr
-	jmp !x anchor_done          ; phase2 == 0 -> already at the anchor
+    set pins, 0b10              ; EXT_CLK_EN HIGH - slow the CPU, inside the gap
+
+    out x, 32                   ; phase2 (pulses to the slowed check edge, post_cnt=24)
+    jmp !x anchor_done
 phase2_loop:
-	wait 1 gpio 28
-	wait 0 gpio 28
-	jmp x-- phase2_loop
+    wait 1 gpio 28
+    wait 0 gpio 28
+    jmp x-- phase2_loop
 anchor_done:
 
-	pull block                  ; x = r_end coarse (whole STBY periods)
-	mov x, osr
-	pull block                  ; y = pulse_width - 1
-	mov y, osr
+    out x, 32                   ; r_end coarse (STBY periods off the check edge)
+    out y, 32                   ; pulse_width - 1
+rend_delay:
+    wait 0 gpio 15
+    wait 1 gpio 15
+    jmp x-- rend_delay
 
-rend_delay:                     ; drift-free: count r_end STBY_CLK periods off the anchor
-	wait 0 gpio 15
-	wait 1 gpio 15
-	jmp x-- rend_delay
-
-	pull block                  ; x = fine (0-3 sys cycles, ~5ns each)
-	mov x, osr
-	jmp !x fire
+    out x, 32                   ; fine (0-3 sys cycles, ~5ns each)
+    jmp !x fire
 fine_delay:
-	jmp x-- fine_delay
+    jmp x-- fine_delay
 fire:
-	set pindirs, 0b11          ; reset -> output LOW (glitch); EXT_CLK_EN stays high
+    set pindirs, 0b11           ; reset -> output LOW (glitch); EXT_CLK_EN stays high
 hold_rst:
-	jmp y-- hold_rst
-	set pindirs, 0b10          ; reset -> input FLOAT (open-drain release)
+    jmp y-- hold_rst
+    set pindirs, 0b10           ; reset -> input FLOAT (open-drain release)
 
-	pull block                  ; x = extc_hold
-	mov x, osr
+    out x, 32                   ; extc_hold
 hold_extc:
-	jmp x-- hold_extc
+    jmp x-- hold_extc
 
-	set pins, 0b00             ; EXT_CLK_EN LOW
-	push block
+    set pins, 0b00              ; EXT_CLK_EN LOW
+    push block

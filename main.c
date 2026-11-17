@@ -188,7 +188,7 @@ static const config_t DEFAULT_CONFIG = {
         /* EXT_CLK seeds from Octal450's Zephyr VHDL @192MHz: r_end 118008,
          * pulse 2, slow_delay ~382ms (73,344,000 cyc), T_BUF 50000, ~12 pulses.
          * These are STRUCTURAL SEEDS - must be dialed in on hardware. */
-        { "zephyr",  METHOD_EXTCLK, { 12, 100, 118008, 2, 50000 } },           /* r_end in Matrix 192MHz units (split to STBY+fine); window 117998-118010 */
+        { "zephyr",  METHOD_EXTCLK, { 12, 18336000u, 118008, 2, 50000 } },     /* [1]=dwell periods (~382ms); r_end in 192MHz units; window 117998-118010 */
         /* Xenon: same EXT_CLK engine; Octal450's VHDL differs from Zephyr only in
          * R_END (118002 vs 118008 @192MHz). Untested - seed, dial in with sweep. */
         { "xenon",   METHOD_EXTCLK, { 12, 100, 118002, 2, 50000 } },           /* r_end in Matrix 192MHz units */
@@ -591,6 +591,7 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
         : glitch_program_get_default_config(offset);
     sm_config_set_set_pins(&c, CPU_RESET, 2);   /* bit0 = RESET, bit1 = PLL/EXTC */
     if (driven) sm_config_set_sideset_pins(&c, CPU_RESET);
+    else sm_config_set_out_shift(&c, false, true, 32);  /* EXT_CLK engine uses autopull (out x,32) */
 
     pio_gpio_init(pio, CPU_RESET);
     gpio_disable_pulls(CPU_RESET);
@@ -647,28 +648,21 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
         pio_sm_put_blocking(pio, sm, t[3]);                  /* glitch_width */
         pio_sm_put_blocking(pio, sm, t[4]);                  /* pll_hold */
     } else {
-        /* EXT_CLK two-phase (sim-derived): EXT_CLK_EN asserts after post_count
-         * pulses - BEFORE the check - then phase2 more pulses reach the fixed
-         * anchor (post_cnt=24 = EXTCLK_ANCHOR pulses), then r_end off the anchor.
-         * Sweep post_count (t[0]) to place the slowdown; anchor + r_end stay put. */
-        uint32_t anchor = g_autosweep ? g_extclk_anchor : 12;
-        uint32_t ph1, ph2;
-        if (g_autosweep) {
-            /* Assert EXT_CLK_EN AT the anchor (the last full-speed POST pulse
-             * before the check), NOT a pulse earlier. The capture showed big
-             * (262/415 ms) POST gaps right before the check; asserting before
-             * them made the slowed CPU crawl through them and mis-time the glitch.
-             * Slow only at the check, where the memcmp actually runs. */
-            ph1 = anchor;
-            ph2 = 0;
-        } else {
-            ph1 = (t[0] < anchor) ? t[0] : anchor; /* manual: post_count = assert point */
-            ph2 = anchor - ph1;
-        }
+        /* EXT_CLK faithful-FSM port (GHDL-confirmed mechanism):
+         *   ph1  = POST pulses to the code before the long pre-check gap (post_cnt=23)
+         *   dwell= t[1] STBY periods spent in that gap before EXT_CLK_EN asserts
+         *          (slower.vhd delay_val) - THE piece every earlier build missed
+         *   ph2  = 1 pulse: wait for the next (now-slowed) POST edge = the check
+         *   r_end= STBY periods off that edge, then the reset pulse.
+         * post_count (ph1) is the sweepable anchor; dwell (t[1]) positions the
+         * slowdown inside the gap; r_end (t[2]) fine-places the reset. */
+        uint32_t ph1   = g_autosweep ? g_extclk_anchor : t[0];
+        uint32_t dwell = t[1];                               /* delay_val in STBY periods */
         uint32_t coarse = t[2] >> 2;                         /* r_end 192MHz-units -> STBY periods */
         uint32_t fine   = t[2] & 3u;                         /* remainder -> ~5ns sys cycles */
-        pio_sm_put_blocking(pio, sm, ph1);                   /* phase1 pulses (full speed) */
-        pio_sm_put_blocking(pio, sm, ph2);                   /* phase2 pulses (slowing, to anchor) */
+        pio_sm_put_blocking(pio, sm, ph1);                   /* post_count (to post_cnt=23) */
+        pio_sm_put_blocking(pio, sm, dwell);                 /* dwell periods (delay_val) */
+        pio_sm_put_blocking(pio, sm, 1u);                    /* phase2 = 1: the slowed check edge */
         pio_sm_put_blocking(pio, sm, coarse);                /* r_end coarse (STBY periods) */
         pio_sm_put_blocking(pio, sm, t[3] > 0 ? t[3] - 1 : 0); /* pulse_width - 1 */
         pio_sm_put_blocking(pio, sm, fine);                  /* fine sys cycles */
@@ -1164,6 +1158,56 @@ static void handle_line(char *line)
             const char *nm = (cap_c[i]&2u)?"RST29":"POST ";
             printf("  %lu.%03lu %s %s\n",(unsigned long)(cap_t[i]/1000),(unsigned long)(cap_t[i]%1000),nm,(cap_c[i]&1u)?"H":"L");
         }
+    } else if (!strcmp(cmd, "matrixspy")) {
+        /* GROUND TRUTH: passively watch a REAL Matrix glitch this console. The Pico
+         * drives nothing - it monitors EXT_CLK_EN (GP27, 3.3V, clean), POST (GP28,
+         * via the diode), and RESET_SENSE (GP29) and timestamps every edge for 15s.
+         * The first EXT_CLK_EN rising edge tells us exactly WHEN the Matrix slows the
+         * CPU relative to POST - the one number our FSM analysis couldn't resolve -
+         * and the whole timeline shows the slowdown's position and width. The 1.1V
+         * reset pulse itself can't be read without a diode, but EXT_CLK is enough.
+         * Install the Matrix, tap GP27/28/29 to the same points, power the console. */
+        #define SPY_MAX 4000u
+        static uint32_t spy_t[SPY_MAX]; static uint8_t spy_c[SPY_MAX];
+        multicore_lockout_start_blocking();                 /* make sure core1 drives nothing */
+        gpio_init(PLL_BYPASS);  gpio_set_dir(PLL_BYPASS, GPIO_IN);  gpio_disable_pulls(PLL_BYPASS);
+        gpio_init(POST_PIN);    gpio_set_dir(POST_PIN, GPIO_IN);    gpio_pull_up(POST_PIN);
+        gpio_init(RESET_SENSE); gpio_set_dir(RESET_SENSE, GPIO_IN);
+        printf("MATRIXSPY: watching a real Matrix for 15s (EXT_CLK/POST/RST_SENSE).\n");
+        printf("Make sure the MATRIX is installed and driving the glitch; power-cycle the console now...\n");
+        uint32_t n=0;
+        bool le=gpio_get(PLL_BYPASS), lp=gpio_get(POST_PIN), ls=gpio_get(RESET_SENSE);
+        uint64_t t0=time_us_64(), tend=t0+15000000ull;
+        while (time_us_64() < tend && n < SPY_MAX) {
+            uint32_t now=(uint32_t)(time_us_64()-t0);
+            bool e=gpio_get(PLL_BYPASS);
+            if (e!=le){ spy_t[n]=now; spy_c[n]=4u|(e?1u:0u); le=e; n++; if(n>=SPY_MAX)break; }
+            bool p=gpio_get(POST_PIN);
+            if (p!=lp){ spy_t[n]=now; spy_c[n]=(p?1u:0u); lp=p; n++; if(n>=SPY_MAX)break; }
+            bool sg=gpio_get(RESET_SENSE);
+            if (sg!=ls){ spy_t[n]=now; spy_c[n]=2u|(sg?1u:0u); ls=sg; n++; }
+        }
+        multicore_lockout_end_blocking();
+        /* key number: POST edge count before the FIRST EXT_CLK_EN assert (rising) */
+        uint32_t pc=0, extc_first_t=0, extc_first_post=0; bool found=false;
+        for (uint32_t i=0;i<n;i++){
+            if ((spy_c[i]&6u)==0) pc++;                      /* POST edge */
+            else if ((spy_c[i]&4u) && (spy_c[i]&1u) && !found){ /* EXT_CLK rising */
+                found=true; extc_first_t=spy_t[i]; extc_first_post=pc;
+            }
+        }
+        printf("edges: %lu total\n", (unsigned long)n);
+        if (found)
+            printf("  -> Matrix asserted EXT_CLK_EN after POST edge #%lu (= %lu pulses), at t=%lu.%03lu ms\n",
+                   (unsigned long)extc_first_post,(unsigned long)(extc_first_post/2),
+                   (unsigned long)(extc_first_t/1000),(unsigned long)(extc_first_t%1000));
+        else
+            printf("  -> no EXT_CLK_EN edge seen (Matrix not driving it, not installed, or wrong tap)\n");
+        printf("raw edges (t_ms : signal):\n");
+        for (uint32_t i=0;i<n;i++){
+            const char *nm = (spy_c[i]&4u)?"EXTCLK":((spy_c[i]&2u)?"RST29 ":"POST  ");
+            printf("  %lu.%03lu %s %s\n",(unsigned long)(spy_t[i]/1000),(unsigned long)(spy_t[i]%1000),nm,(spy_c[i]&1u)?"H":"L");
+        }
     } else if (!strcmp(cmd, "mon")) {
         printf("monitoring GP26/GP28/GP29 for 12s - power-cycle the console now...\n");
         gpio_init(RESET_SENSE); gpio_set_dir(RESET_SENSE, GPIO_IN);
@@ -1308,16 +1352,14 @@ int main(void)
      * (which could be an RGH1.2 one that drives the reset line) on a Zephyr. */
     bool autorun = (MP_EXTCLK_PROFILE < NUM_PROFILES &&
                     g_cfg.profiles[MP_EXTCLK_PROFILE].method == METHOD_EXTCLK);
-    uint32_t saved_rend = 0, saved_anchor = 0; bool have_saved = false;
     if (autorun) {
         g_cfg.active = MP_EXTCLK_PROFILE;
         uint32_t *zt = g_cfg.profiles[g_cfg.active].t;
-        /* Surface any previously-saved landing (from an earlier successful boot)
-         * before we reseed and sweep again. */
-        if (zt[1] == EXTCLK_LOCK_MAGIC) {
-            have_saved = true; saved_rend = zt[2]; saved_anchor = zt[0];
-        }
-        zt[0] = 12; zt[1] = 100; zt[2] = 118008; zt[3] = 2; zt[4] = 50000;
+        /* Faithful-FSM seed: [0] post_count anchor, [1] dwell in STBY periods
+         * (~382ms = full EXT_CLK delay_val, pins EXT_CLK_EN inside the pre-check
+         * gap), [2] r_end (192MHz units), [3] pulse, [4] extc_hold. The spy pins
+         * dwell + anchor exactly from the real Matrix; the sweep refines r_end. */
+        zt[0] = 12; zt[1] = 18336000u; zt[2] = 118008; zt[3] = 2; zt[4] = 50000;
         autosweep_setup();
     }
 #endif
@@ -1334,9 +1376,6 @@ int main(void)
                "          anchor %lu-%lu pulses, pulse=2. LED: blue=trying, green=BOOT, red=miss.\n",
                (unsigned long)sweep_start, (unsigned long)sweep_end,
                (unsigned long)g_as_anchor_lo, (unsigned long)g_as_anchor_hi);
-        if (have_saved)
-            printf("[AUTORUN] *** previous successful boot saved: r_end=%lu anchor=%lu pulses ***\n",
-                   (unsigned long)saved_rend, (unsigned long)saved_anchor);
     }
 #endif
     printf("> ");
@@ -1360,7 +1399,6 @@ int main(void)
              * (run_glitch_once wrote sweep_val before the attempt); stamp the anchor
              * into t[0] and the lock marker into t[1], then save. */
             g_cfg.profiles[g_cfg.active].t[0] = g_as_anchor_landed;
-            g_cfg.profiles[g_cfg.active].t[1] = EXTCLK_LOCK_MAGIC;
             g_cfg.profiles[g_cfg.active].t[2] = sweep_landed_val;
             config_save();
             printf("\n*** GLITCH LANDED + SAVED: r_end = %lu  anchor = %lu pulses ***\n"

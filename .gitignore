@@ -12,3 +12,4 @@ __pycache__/
 
 !firmware/*.uf2
 build_diag/
+*.vcd
