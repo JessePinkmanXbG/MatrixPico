@@ -1,0 +1,7 @@
+# This is a generated file and its contents are an internal implementation detail.
+# The patch step will be re-executed if anything in this file changes.
+# No other meaning or use of this file is supported.
+
+command (connected)=/usr/bin/cmake;-Dcan_fetch=YES;-P;/tmp/claude-0/-home-claude/c0b49cca-c65c-5126-a29c-819947104f05/scratchpad/extsync/build_diag/_deps/picotool-subbuild/picotool-populate-prefix/tmp/picotool-populate-gitupdate.cmake
+command (disconnected)=/usr/bin/cmake;-Dcan_fetch=NO;-P;/tmp/claude-0/-home-claude/c0b49cca-c65c-5126-a29c-819947104f05/scratchpad/extsync/build_diag/_deps/picotool-subbuild/picotool-populate-prefix/tmp/picotool-populate-gitupdate.cmake
+work_dir=/tmp/claude-0/-home-claude/c0b49cca-c65c-5126-a29c-819947104f05/scratchpad/extsync/build_diag/_deps/picotool-src

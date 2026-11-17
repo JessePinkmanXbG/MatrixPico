@@ -1078,7 +1078,7 @@ static void handle_line(char *line)
         gpio_init(POST_PIN);    gpio_set_dir(POST_PIN, GPIO_IN);    gpio_pull_up(POST_PIN);
         gpio_init(RESET_SENSE); gpio_set_dir(RESET_SENSE, GPIO_IN);
         gpio_init(PLL_BYPASS);  gpio_set_dir(PLL_BYPASS, GPIO_OUT); gpio_put(PLL_BYPASS, 0);  /* EXT_CLK_EN low */
-        printf("CAPTURESLOW: arm on reset, count %lu POST pulses, assert EXT_CLK_EN, watch 400ms.\n", (unsigned long)npulse);
+        printf("CAPTURESLOW: arm on reset, count %lu POST pulses, assert EXT_CLK_EN, watch 15s.\n", (unsigned long)npulse);
         printf("Power-cycle the console now...\n");
         /* arm: wait for GP29 LOW (reset), then catch POST from the first edge */
         while (gpio_get(RESET_SENSE)) { if (getchar_timeout_us(0) != PICO_ERROR_TIMEOUT) { } tight_loop_contents(); }
@@ -1088,7 +1088,7 @@ static void handle_line(char *line)
             while(gpio_get(POST_PIN)) tight_loop_contents();
         }
         gpio_put(PLL_BYPASS, 1);                      /* EXT_CLK_EN HIGH: slow the CPU NOW */
-        uint64_t t0=time_us_64(), tend=t0+400000ull;  /* watch 400ms */
+        uint64_t t0=time_us_64(), tend=t0+15000000ull; /* watch 15s: slowed edges are 100s of ms apart */
         uint32_t n=0; bool lp=gpio_get(POST_PIN), ls=gpio_get(RESET_SENSE);
         while (time_us_64() < tend && n < CAPS_MAX) {
             uint32_t now=(uint32_t)(time_us_64()-t0);
