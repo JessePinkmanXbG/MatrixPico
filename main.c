@@ -188,7 +188,7 @@ static const config_t DEFAULT_CONFIG = {
         /* EXT_CLK seeds from Octal450's Zephyr VHDL @192MHz: r_end 118008,
          * pulse 2, slow_delay ~382ms (73,344,000 cyc), T_BUF 50000, ~12 pulses.
          * These are STRUCTURAL SEEDS - must be dialed in on hardware. */
-        { "zephyr",  METHOD_EXTCLK, { 12, 18336000u, 118008, 2, 50000 } },     /* [1]=dwell periods (~382ms); r_end in 192MHz units; window 117998-118010 */
+        { "zephyr",  METHOD_EXTCLK, { 12, 18329600u, 118008, 2, 50000 } },     /* [1]=dwell periods (~382ms); r_end in 192MHz units; window 117998-118010 */
         /* Xenon: same EXT_CLK engine; Octal450's VHDL differs from Zephyr only in
          * R_END (118002 vs 118008 @192MHz). Untested - seed, dial in with sweep. */
         { "xenon",   METHOD_EXTCLK, { 12, 100, 118002, 2, 50000 } },           /* r_end in Matrix 192MHz units */
@@ -660,10 +660,9 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
         uint32_t dwell = t[1];                               /* delay_val in STBY periods */
         uint32_t coarse = t[2] >> 2;                         /* r_end 192MHz-units -> STBY periods */
         uint32_t fine   = t[2] & 3u;                         /* remainder -> ~5ns sys cycles */
-        pio_sm_put_blocking(pio, sm, ph1);                   /* post_count (to post_cnt=23) */
-        pio_sm_put_blocking(pio, sm, dwell);                 /* dwell periods (delay_val) */
-        pio_sm_put_blocking(pio, sm, 1u);                    /* phase2 = 1: the slowed check edge */
-        pio_sm_put_blocking(pio, sm, coarse);                /* r_end coarse (STBY periods) */
+        pio_sm_put_blocking(pio, sm, ph1);                   /* post_count into the pre-check region */
+        pio_sm_put_blocking(pio, sm, dwell);                 /* dwell periods (delay_val=18329600) */
+        pio_sm_put_blocking(pio, sm, coarse);                /* r_end coarse (STBY periods off the check) */
         pio_sm_put_blocking(pio, sm, t[3] > 0 ? t[3] - 1 : 0); /* pulse_width - 1 */
         pio_sm_put_blocking(pio, sm, fine);                  /* fine sys cycles */
         pio_sm_put_blocking(pio, sm, t[4]);                  /* extc_hold */
@@ -916,14 +915,15 @@ static int find_profile(const char *s)
  * revisits every (r_end, anchor) point many times and clock jitter lands it. */
 static void autosweep_setup(void)
 {
-    g_cfg.profiles[g_cfg.active].t[3] = 2;          /* reset pulse = 2 units (~10 ns) = R_LEN=2 */
-    sweep_idx   = 2;                                /* inner: r_end (Matrix 192 MHz units) */
-    sweep_start = 117968; sweep_end = 118048; sweep_step = 1;   /* dense 5 ns steps, +/-200ns */
+    g_cfg.profiles[g_cfg.active].t[3] = 2;          /* R_LEN=2 (exact, from Octal450 source) */
+    sweep_idx   = 2;                                /* inner: r_end around the exact 118008 */
+    sweep_start = 117988; sweep_end = 118028; sweep_step = 1;   /* dense 5 ns, +/-100ns of exact */
     sweep_val   = sweep_start;
-    /* MEASURED: the capture put the signature check right after POST edge #26 =
-     * 13 pulses, identically on two consecutive boots. Pin the anchor there. */
-    g_as_anchor_lo = 13; g_as_anchor_hi = 13;
-    g_extclk_anchor = 13;
+    /* Anchor (post_count) brings us into the pre-check region; the engine's extra
+     * edge-wait then lands on post_cnt=23 (the code before the 415ms gap). Capture
+     * put that at ~12 pulses; hedge +/-1 for burst-edge count variation. */
+    g_as_anchor_lo = 11; g_as_anchor_hi = 13;
+    g_extclk_anchor = 12;
     g_as_anchor_changed = true;
     sweep_landed = false;
     g_autosweep = true;
@@ -1359,7 +1359,7 @@ int main(void)
          * (~382ms = full EXT_CLK delay_val, pins EXT_CLK_EN inside the pre-check
          * gap), [2] r_end (192MHz units), [3] pulse, [4] extc_hold. The spy pins
          * dwell + anchor exactly from the real Matrix; the sweep refines r_end. */
-        zt[0] = 12; zt[1] = 18336000u; zt[2] = 118008; zt[3] = 2; zt[4] = 50000;
+        zt[0] = 12; zt[1] = 18329600u; zt[2] = 118008; zt[3] = 2; zt[4] = 50000;
         autosweep_setup();
     }
 #endif

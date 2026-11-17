@@ -1,49 +1,45 @@
-; Matrix Pico EXT_CLK engine (Xenon/Zephyr) - FAITHFUL FSM PORT
+; Matrix Pico EXT_CLK engine (Zephyr) - FAITHFUL FSM PORT
 ;
-; Logic derived from Octal450's EXT_CLK VHDL (15432, GliGli, Octal450) and
-; CONFIRMED by GHDL simulation of post_proc.vhd + slower.vhd. GPLv2.
+; Constants are Octal450's ORIGINAL matrix-coolrunner-192mhz design (the Matrix V3):
+;   R_END=118008 (Zephyr), R_LEN=2, post_rgh=24, delay_val=4475 (90nm) -> dwell
+;   = 4475*4096 = 18,329,600 STBY periods (~382 ms). GHDL-confirmed mechanism.
 ;
-; The mechanism the sim proved (and that our earlier open-loop builds missed):
-;   1. count POST pulses to the code just before the long pre-check POST gap
-;      (post_cnt = post_rgh-1 = 23).
-;   2. DWELL for delay_val time (slower.vhd) - this is spent inside that gap,
-;      at full CPU speed - THEN assert EXT_CLK_EN. So the slowdown lands inside
-;      the gap, with the CPU still running, right before the signature check.
-;   3. wait for the next POST edge (post_cnt = 24 = the check), now slowed.
-;   4. time R_END STBY periods off that edge and pulse CPU_RESET.
+; Sequence (works because the pre-check POST gap on this console is ~415 ms, so
+; nothing POSTs during the ~382 ms dwell - post_cnt doesn't move, exactly as the
+; parallel FSM assumes):
+;   1. count post_count pulses up into the pre-check region.
+;   2. wait one POST edge = reach the code before the long gap (post_cnt=23).
+;   3. DWELL delay_val STBY periods inside that gap, CPU still full speed.
+;   4. assert EXT_CLK_EN (slow the CPU), still inside the gap.
+;   5. wait one POST edge = the now-slowed signature check (post_cnt=24).
+;   6. time R_END STBY periods off that edge and pulse CPU_RESET.
 ;
-; SET pins (base = CPU_RESET, count = 2): bit0 = CPU_RESET (open-drain glitch),
-; bit1 = EXT_CLK_EN (push-pull). POST on GPIO 28 (diode + pull-up). STBY on GP15.
-; Uses autopull (threshold 32): each `out x,32` consumes one pushed value.
-;
-; C pushes 7 values in order: post_count, dwell_periods, phase2,
-; r_end_coarse, pulse_width-1, fine, extc_hold.
+; SET pins (base=CPU_RESET, count=2): bit0=CPU_RESET (open-drain glitch),
+; bit1=EXT_CLK_EN (push-pull). POST=GP28 (diode+pull-up). STBY=GP15. Autopull(32).
+; C pushes 6 values: post_count, dwell_periods, r_end_coarse, pulse_width-1,
+; fine, extc_hold.
 
 .program extclk
 
-    out x, 32                   ; post_count  (phase 1: full-speed pulses to post_cnt=23)
+    out x, 32                   ; post_count (pulses into the pre-check region)
 phase1_loop:
     wait 1 gpio 28
     wait 0 gpio 28
     jmp x-- phase1_loop
 
+    wait 1 gpio 28              ; one more edge -> post_cnt=23 (code before the gap)
+
     out x, 32                   ; dwell_periods (slower.vhd delay_val, in STBY periods)
-    jmp !x no_dwell             ; 0 -> assert immediately (legacy behavior)
-dwell_loop:                     ; wait inside the pre-check gap, CPU still full speed
+    jmp !x no_dwell
+dwell_loop:                     ; wait inside the gap; CPU still full speed
     wait 0 gpio 15
     wait 1 gpio 15
     jmp x-- dwell_loop
 no_dwell:
 
-    set pins, 0b10              ; EXT_CLK_EN HIGH - slow the CPU, inside the gap
+    set pins, 0b10             ; EXT_CLK_EN HIGH - slow the CPU, inside the gap
 
-    out x, 32                   ; phase2 (pulses to the slowed check edge, post_cnt=24)
-    jmp !x anchor_done
-phase2_loop:
-    wait 1 gpio 28
-    wait 0 gpio 28
-    jmp x-- phase2_loop
-anchor_done:
+    wait 0 gpio 28             ; the now-slowed signature-check edge (post_cnt=24)
 
     out x, 32                   ; r_end coarse (STBY periods off the check edge)
     out y, 32                   ; pulse_width - 1
@@ -57,14 +53,14 @@ rend_delay:
 fine_delay:
     jmp x-- fine_delay
 fire:
-    set pindirs, 0b11           ; reset -> output LOW (glitch); EXT_CLK_EN stays high
+    set pindirs, 0b11          ; reset -> output LOW (glitch); EXT_CLK_EN stays high
 hold_rst:
     jmp y-- hold_rst
-    set pindirs, 0b10           ; reset -> input FLOAT (open-drain release)
+    set pindirs, 0b10          ; reset -> input FLOAT (open-drain release)
 
     out x, 32                   ; extc_hold
 hold_extc:
     jmp x-- hold_extc
 
-    set pins, 0b00              ; EXT_CLK_EN LOW
+    set pins, 0b00             ; EXT_CLK_EN LOW
     push block
