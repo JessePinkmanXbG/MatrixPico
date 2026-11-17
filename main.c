@@ -91,7 +91,10 @@
  * ~7s for the SMC watchdog. Safe because it only fires on frozen POST in a
  * 3-7s window; a real boot keeps POST moving. Set MP_FORCE_REBOOT=0 to disable. */
 #ifndef MP_FORCE_REBOOT
-#define MP_FORCE_REBOOT 1
+#define MP_FORCE_REBOOT 0   /* OFF for unattended runs: a successful boot can have a
+                             * >2s POST-quiet stretch (CD/kernel/XeLL load) that the
+                             * hang-detector would mistake for a failure and reboot,
+                             * killing the very boot we want before the 12s confirm. */
 #endif
 #ifndef MP_FREEZE_MS
 #define MP_FREEZE_MS 2200       /* POST still this long while held high = hang */
@@ -909,7 +912,7 @@ static void autosweep_setup(void)
 {
     g_cfg.profiles[g_cfg.active].t[3] = 2;          /* reset pulse = 2 units (~10 ns) = R_LEN=2 */
     sweep_idx   = 2;                                /* inner: r_end (Matrix 192 MHz units) */
-    sweep_start = 117988; sweep_end = 118028; sweep_step = 1;   /* dense 5 ns steps, +/-100ns */
+    sweep_start = 117968; sweep_end = 118048; sweep_step = 1;   /* dense 5 ns steps, +/-200ns */
     sweep_val   = sweep_start;
     /* MEASURED: the capture put the signature check right after POST edge #26 =
      * 13 pulses, identically on two consecutive boots. Pin the anchor there. */
