@@ -675,12 +675,28 @@ static void run_glitch_once(PIO pio, uint sm, uint offset, uint method)
         pio_sm_put_blocking(pio, sm, t[4]);                  /* extc_hold */
     }
 
-    while (pio_sm_is_rx_fifo_empty(pio, sm))
+    /* Wait for the glitch to complete, but don't block forever: if the console
+     * never POSTs enough to reach the anchor (powered off, stuck, or mid-reset-
+     * loop), phase1 would hang here. Time out, release EXT_CLK_EN, and re-arm. */
+    absolute_time_t gs = get_absolute_time();
+    bool fired = true;
+    while (pio_sm_is_rx_fifo_empty(pio, sm)) {
         led_tick();
-    pio_sm_get_blocking(pio, sm);         /* glitch complete */
+        if (absolute_time_diff_us(gs, get_absolute_time()) > 20000000) { fired = false; break; }
+    }
+    if (fired) pio_sm_get_blocking(pio, sm);   /* glitch complete */
 
     pio_sm_set_enabled(pio, sm, false);
     pio_sm_restart(pio, sm);
+
+    if (!fired) {
+        /* aborted: make sure EXT_CLK_EN isn't left asserted, then retry (no miss
+         * scored, no sweep step - this attempt simply didn't happen). */
+        gpio_init(PLL_BYPASS);
+        gpio_set_dir(PLL_BYPASS, GPIO_OUT);
+        gpio_put(PLL_BYPASS, 0);
+        return;
+    }
 
     gpio_init(arm_pin);
     gpio_set_dir(arm_pin, GPIO_IN);
