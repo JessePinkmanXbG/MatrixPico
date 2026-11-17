@@ -898,10 +898,13 @@ static void autosweep_setup(void)
 {
     g_cfg.profiles[g_cfg.active].t[3] = 2;          /* reset pulse = 2 units (~10 ns) = R_LEN=2 */
     sweep_idx   = 2;                                /* inner: r_end (Matrix 192 MHz units) */
-    sweep_start = 117998; sweep_end = 118010; sweep_step = 1;   /* dense 5 ns steps */
+    sweep_start = 117994; sweep_end = 118014; sweep_step = 1;   /* dense 5 ns steps, slight margin */
     sweep_val   = sweep_start;
-    g_as_anchor_lo = 11; g_as_anchor_hi = 13;       /* outer: anchor pulses, hedge +/-1 */
-    g_extclk_anchor = 12;                            /* start on the exact Matrix anchor (post_rgh=24) */
+    /* Our diode POST read undercounts edges vs a real Matrix: our own capture put
+     * the signature check at our edge ~20 (= 10 pulses), so anchor around 10, not
+     * the Matrix's literal post_rgh=24 (=12). Hedge 9-11. */
+    g_as_anchor_lo = 9; g_as_anchor_hi = 11;
+    g_extclk_anchor = 10;
     g_as_anchor_changed = true;
     sweep_landed = false;
     g_autosweep = true;
